@@ -1,8 +1,8 @@
 # @sathyendra/security-checker
 
 [![npm version](https://img.shields.io/npm/v/@sathyendra/security-checker)](https://www.npmjs.com/package/@sathyendra/security-checker)
-[![license](https://img.shields.io/npm/l/@sathyendra/security-checker)](https://github.com/sathyendrav/security-checker/blob/main/LICENSE)
-[![node](https://img.shields.io/node/v/@sathyendra/security-checker)](https://github.com/sathyendrav/security-checker)
+[![license](https://img.shields.io/github/license/sathyendrav/security-checker)](https://github.com/sathyendrav/security-checker/blob/main/LICENSE)
+[![node](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)](https://github.com/sathyendrav/security-checker)
 [![GitHub stars](https://img.shields.io/github/stars/sathyendrav/security-checker)](https://github.com/sathyendrav/security-checker)
 [![GitHub issues](https://img.shields.io/github/issues/sathyendrav/security-checker)](https://github.com/sathyendrav/security-checker/issues)
 [![zero dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](https://github.com/sathyendrav/security-checker)
