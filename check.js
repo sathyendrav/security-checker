@@ -1343,6 +1343,8 @@ const MALICIOUS_PYPI_PACKAGES = [
  *   3. Pipfile.lock — structured JSON, checked against the blocklist
  *   4. Suspicious .py files in the project root — potential backdoor stagers
  *      that shouldn't exist in a Node.js project
+ *   5. Malicious .pth files in Python site-packages — "importless" execution
+ *      backdoors that run at Python startup via the site module
  *
  * @param {object[]} threats - Array to push structured threat objects into ({message, category, fixable, fixDescription, fix}).
  */
@@ -1362,6 +1364,17 @@ function crossEcosystemScan(threats) {
   //    A .py file in a Node.js project root is unusual; doubly so if it
   //    contains network/subprocess calls typical of backdoor stagers.
   detectPythonStagers(cwd, threats);
+
+  // 5. Scan for malicious .pth files in Python site-packages
+  //    TeamPCP used .pth files for "importless" execution — Python's site module
+  //    processes .pth files at startup, executing any line starting with `import`.
+  //    Only triggered when a Python dependency file exists (cross-ecosystem project).
+  const hasPythonDeps = ['requirements.txt', 'requirements-dev.txt', 'requirements_dev.txt',
+    'Pipfile', 'Pipfile.lock', 'pyproject.toml', 'setup.py', 'setup.cfg']
+    .some(f => fs.existsSync(path.join(cwd, f)));
+  if (hasPythonDeps) {
+    scanMaliciousPthFiles(threats);
+  }
 }
 
 /**
@@ -1475,6 +1488,221 @@ function scanPipfileLock(cwd, threats) {
       }
     }
   }
+}
+
+/**
+ * Malicious .pth file patterns — used for "importless" execution.
+ *
+ * Python's `site` module processes `.pth` files in `site-packages` at startup.
+ * Any line beginning with `import ` is executed as Python code. TeamPCP abused
+ * this to achieve persistent code execution without importing a module directly.
+ *
+ * This array contains regex patterns that detect:
+ *   - base64 decoding (obfuscated payload injection)
+ *   - subprocess/os.system calls (command execution)
+ *   - socket/urllib/requests usage (C2 communication)
+ *   - exec/eval (dynamic code execution)
+ *   - compile() with encoded strings (obfuscated compilation)
+ *   - __import__ (stealth imports to avoid detection)
+ *   - codecs.decode (alternative obfuscation)
+ */
+const PTH_SUSPICIOUS_PATTERNS = [
+  /base64\s*\.\s*b64decode/,
+  /subprocess\s*\.\s*(Popen|call|run|check_output)/,
+  /os\s*\.\s*system\s*\(/,
+  /socket\s*\.\s*socket\s*\(/,
+  /urllib/,
+  /requests\s*\.\s*(get|post)\s*\(/,
+  /\bexec\s*\(/,
+  /\beval\s*\(/,
+  /\bcompile\s*\(/,
+  /__import__\s*\(/,
+  /codecs\s*\.\s*decode/,
+];
+
+/**
+ * Scan Python site-packages directories for malicious .pth files.
+ *
+ * `.pth` files are automatically processed by Python at startup. Legitimate
+ * `.pth` files contain simple directory paths (one per line) that get added
+ * to `sys.path`. However, any line starting with `import ` in a `.pth` file
+ * is executed as Python code — TeamPCP exploited this for "importless"
+ * backdoor execution that persists across all Python invocations.
+ *
+ * Detection strategy:
+ *   1. Locate Python site-packages directories using `python -c "import site; ..."`
+ *   2. Scan all `.pth` files in each site-packages directory
+ *   3. Look for `import` lines that contain suspicious patterns (base64 decode,
+ *      subprocess calls, network operations, eval/exec)
+ *   4. Flag files with any suspicious executable import line
+ *
+ * @param {object[]} threats - Array to push structured threat objects into ({message, category, fixable, fixDescription, fix}).
+ */
+function scanMaliciousPthFiles(threats) {
+  // Discover site-packages directories from the Python environment
+  const sitePackagesDirs = discoverSitePackages();
+  if (sitePackagesDirs.length === 0) return;
+
+  for (const siteDir of sitePackagesDirs) {
+    let entries;
+    try {
+      entries = fs.readdirSync(siteDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.pth')) continue;
+
+      const pthPath = path.join(siteDir, entry.name);
+      let content;
+      try {
+        content = fs.readFileSync(pthPath, 'utf8');
+      } catch {
+        continue;
+      }
+
+      // .pth files are line-based. Lines starting with "import " are executed
+      // as Python code at startup. Normal .pth files only contain directory paths.
+      const lines = content.split('\n');
+      const suspiciousLines = [];
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+
+        // Check lines that contain executable import statements
+        // Python executes any line starting with "import " in .pth files
+        const isImportLine = /^\s*import\s/.test(trimmed);
+        if (!isImportLine) continue;
+
+        // Check if this import line contains suspicious patterns
+        const matchedPatterns = PTH_SUSPICIOUS_PATTERNS.filter(p => p.test(trimmed));
+        if (matchedPatterns.length > 0) {
+          suspiciousLines.push(trimmed);
+        }
+      }
+
+      if (suspiciousLines.length > 0) {
+        threats.push({
+          message: `PTH BACKDOOR: malicious .pth file "${entry.name}" in ${siteDir} — ` +
+            `contains ${suspiciousLines.length} executable import line(s) with suspicious patterns ` +
+            `(base64, subprocess, exec, eval, network calls). This enables "importless" ` +
+            `code execution at Python startup.`,
+          category: 'TEAMPCP',
+          fixable: false,
+          fixDescription: null,
+          fix: null
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Discover Python site-packages directories.
+ *
+ * Tries multiple approaches:
+ *   1. Run `python3 -c "..."` or `python -c "..."` to get site-packages paths
+ *   2. Fall back to common well-known site-packages locations
+ *
+ * @returns {string[]} Array of existing site-packages directory paths.
+ */
+function discoverSitePackages() {
+  const allDirs = [];
+  const pythonCmds = os.platform() === 'win32'
+    ? ['python', 'python3', 'py']
+    : ['python3', 'python'];
+
+  // Attempt to discover site-packages via Python's site module
+  for (const pyCmd of pythonCmds) {
+    try {
+      const output = execSync(
+        `${pyCmd} -c "import site; print('\\n'.join(site.getsitepackages()))"`,
+        { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }
+      );
+      const dirs = output.trim().split('\n')
+        .map(d => d.trim())
+        .filter(d => d && fs.existsSync(d));
+      if (dirs.length > 0) {
+        allDirs.push(...dirs);
+        break; // Found system site-packages, stop trying other Python commands
+      }
+    } catch {
+      // Python not available or failed — try next
+    }
+  }
+
+  // If no system site-packages found, check common well-known paths
+  if (allDirs.length === 0) {
+    if (os.platform() === 'win32') {
+      const localAppData = process.env.LOCALAPPDATA || '';
+      if (localAppData) {
+        try {
+          const pythonDir = path.join(localAppData, 'Programs', 'Python');
+          if (fs.existsSync(pythonDir)) {
+            const versions = fs.readdirSync(pythonDir).filter(d =>
+              d.startsWith('Python')
+            );
+            for (const ver of versions) {
+              const sp = path.join(pythonDir, ver, 'Lib', 'site-packages');
+              if (fs.existsSync(sp)) allDirs.push(sp);
+            }
+          }
+        } catch { /* ignore */ }
+      }
+    } else {
+      const homeDir = os.homedir();
+      const candidates = [
+        '/usr/lib/python3/dist-packages',
+        '/usr/local/lib/python3/dist-packages',
+        path.join(homeDir, '.local', 'lib'),
+      ];
+      for (const candidate of candidates) {
+        try {
+          if (fs.existsSync(candidate)) {
+            if (candidate.endsWith('dist-packages') || candidate.endsWith('site-packages')) {
+              allDirs.push(candidate);
+            } else {
+              const subDirs = fs.readdirSync(candidate).filter(d => d.startsWith('python'));
+              for (const sub of subDirs) {
+                const sp = path.join(candidate, sub, 'site-packages');
+                if (fs.existsSync(sp)) allDirs.push(sp);
+              }
+            }
+          }
+        } catch { /* ignore */ }
+      }
+    }
+  }
+
+  // ALWAYS check for local venvs in the project directory — these can be
+  // compromised independently of the system Python installation
+  const cwd = process.cwd();
+  const venvDirs = ['.venv', 'venv', 'env', '.env'];
+  for (const vd of venvDirs) {
+    const venvBase = path.join(cwd, vd);
+    if (!fs.existsSync(venvBase)) continue;
+    const libDir = os.platform() === 'win32'
+      ? path.join(venvBase, 'Lib', 'site-packages')
+      : path.join(venvBase, 'lib');
+    if (os.platform() === 'win32') {
+      if (fs.existsSync(libDir)) allDirs.push(libDir);
+    } else {
+      try {
+        if (fs.existsSync(libDir)) {
+          const pyVersionDirs = fs.readdirSync(libDir).filter(d => d.startsWith('python'));
+          for (const pv of pyVersionDirs) {
+            const sp = path.join(libDir, pv, 'site-packages');
+            if (fs.existsSync(sp)) allDirs.push(sp);
+          }
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Deduplicate
+  return [...new Set(allDirs)];
 }
 
 /**
