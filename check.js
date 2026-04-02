@@ -457,6 +457,15 @@ async function check(options = {}) {
   //     means the package no longer receives security patches.
   checkOutdatedDeps(threats);
 
+  // 11. Registry configuration check (A08 — Software and Data Integrity Failures).
+  //     Verifies that the configured npm registry is the official one
+  //     (https://registry.npmjs.org). A non-official registry — especially an
+  //     attacker-controlled one — enables Dependency Confusion attacks where
+  //     an internal package name is claimed on the rogue registry.
+  //     Checks project .npmrc, user ~/.npmrc, npm effective config, and
+  //     lockfile resolved URLs for non-official registry hosts.
+  checkRegistryConfig(threats);
+
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
   if (!jsonMode) {
@@ -2199,6 +2208,221 @@ function parseMajor(version) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  11. Registry Configuration Check (OWASP A08 — Dependency Confusion)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The canonical npm registry URL. Any configured registry that differs from
+ * this (and is not a well-known SaaS mirror like GitHub Packages, Azure
+ * Artifacts, or JFrog Artifactory) is flagged as a Dependency Confusion risk.
+ */
+const OFFICIAL_NPM_REGISTRY = 'https://registry.npmjs.org/';
+
+/**
+ * Check the npm registry configuration for Dependency Confusion risks.
+ *
+ * Dependency Confusion (OWASP A08) occurs when an internal package name
+ * collides with a public npm package, and the developer's registry points
+ * to a private feed that an attacker can also publish to — or worse, a
+ * completely attacker-controlled registry.
+ *
+ * Detection layers:
+ *   1. Project .npmrc — checks <cwd>/.npmrc for a `registry=` override.
+ *   2. User .npmrc — checks ~/.npmrc for a global `registry=` override.
+ *   3. npm config — runs `npm config get registry` to capture the effective
+ *      registry URL (accounts for env vars, built-in defaults, etc.).
+ *   4. Lockfile resolved URLs — scans every `resolved` URL in
+ *      package-lock.json for non-official registry hosts.
+ *
+ * @param {{ message: string, category: string, fixable: boolean, fixDescription: string|null, fix: Function|null }[]} threats
+ * @param {object} [_testData] - Optional test injection data to avoid filesystem/exec calls.
+ * @param {string|null} [_testData.projectNpmrc] - Contents of project .npmrc (null = not present).
+ * @param {string|null} [_testData.userNpmrc] - Contents of user ~/.npmrc (null = not present).
+ * @param {string|null} [_testData.npmConfigRegistry] - Simulated `npm config get registry` output.
+ * @param {string|null} [_testData.lockfileContent] - Simulated package-lock.json content.
+ */
+function checkRegistryConfig(threats, _testData) {
+  const flagged = new Set();
+
+  // ── Layer 1: Project .npmrc ──────────────────────────────────────────
+  const projectNpmrc = _testData
+    ? _testData.projectNpmrc
+    : readFileSafe(path.join(process.cwd(), '.npmrc'));
+
+  if (projectNpmrc) {
+    const reg = extractRegistryFromNpmrc(projectNpmrc);
+    if (reg && !isOfficialRegistry(reg)) {
+      const key = `project-npmrc:${reg}`;
+      if (!flagged.has(key)) {
+        flagged.add(key);
+        threats.push({
+          message: `REGISTRY: Project .npmrc overrides registry to ${reg} — Dependency Confusion risk (OWASP A08)`,
+          category: 'REGISTRY',
+          fixable: false,
+          fixDescription: null,
+          fix: null
+        });
+      }
+    }
+  }
+
+  // ── Layer 2: User ~/.npmrc ───────────────────────────────────────────
+  const userNpmrc = _testData
+    ? _testData.userNpmrc
+    : readFileSafe(path.join(os.homedir(), '.npmrc'));
+
+  if (userNpmrc) {
+    const reg = extractRegistryFromNpmrc(userNpmrc);
+    if (reg && !isOfficialRegistry(reg)) {
+      const key = `user-npmrc:${reg}`;
+      if (!flagged.has(key)) {
+        flagged.add(key);
+        threats.push({
+          message: `REGISTRY: User ~/.npmrc overrides registry to ${reg} — Dependency Confusion risk (OWASP A08)`,
+          category: 'REGISTRY',
+          fixable: false,
+          fixDescription: null,
+          fix: null
+        });
+      }
+    }
+  }
+
+  // ── Layer 3: Effective npm config ────────────────────────────────────
+  let npmConfigReg = _testData ? _testData.npmConfigRegistry : null;
+  if (!_testData) {
+    try {
+      npmConfigReg = execSync('npm config get registry', {
+        encoding: 'utf8',
+        timeout: 10000,
+        stdio: ['ignore', 'pipe', 'ignore']
+      }).trim();
+    } catch {
+      // npm not available or timed out — skip
+    }
+  }
+
+  if (npmConfigReg && !isOfficialRegistry(npmConfigReg)) {
+    const key = `npm-config:${npmConfigReg}`;
+    if (!flagged.has(key)) {
+      flagged.add(key);
+      threats.push({
+        message: `REGISTRY: npm effective registry is ${npmConfigReg} — Dependency Confusion risk (OWASP A08)`,
+        category: 'REGISTRY',
+        fixable: false,
+        fixDescription: null,
+        fix: null
+      });
+    }
+  }
+
+  // ── Layer 4: Lockfile resolved URLs ──────────────────────────────────
+  let lockContent = _testData ? _testData.lockfileContent : null;
+  if (!_testData) {
+    lockContent = readFileSafe(path.join(process.cwd(), 'package-lock.json'));
+  }
+
+  if (lockContent) {
+    let lockData;
+    try { lockData = JSON.parse(lockContent); } catch { lockData = null; }
+
+    if (lockData) {
+      const nonOfficialHosts = new Set();
+      collectResolvedUrls(lockData, nonOfficialHosts);
+
+      for (const host of nonOfficialHosts) {
+        threats.push({
+          message: `REGISTRY: package-lock.json contains resolved URLs from ${host} — verify this is a trusted registry (OWASP A08)`,
+          category: 'REGISTRY',
+          fixable: false,
+          fixDescription: null,
+          fix: null
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Read a file and return its contents, or null if it doesn't exist.
+ * @param {string} filePath
+ * @returns {string|null}
+ */
+function readFileSafe(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract the `registry=<url>` value from an .npmrc file's text.
+ * Only matches the base registry setting, not scoped registries like
+ * `@myorg:registry=...` (those are legitimate private scope configs).
+ *
+ * @param {string} content - Contents of an .npmrc file.
+ * @returns {string|null} The registry URL, or null if not found.
+ */
+function extractRegistryFromNpmrc(content) {
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    // Skip comments and scoped registry overrides (@scope:registry=...)
+    if (trimmed.startsWith('#') || trimmed.startsWith(';')) continue;
+    if (trimmed.startsWith('@')) continue;
+    const match = /^registry\s*=\s*(.+)$/i.exec(trimmed);
+    if (match) return match[1].trim();
+  }
+  return null;
+}
+
+/**
+ * Check if a registry URL is the official npm registry.
+ * Normalizes trailing slashes and protocol for comparison.
+ *
+ * @param {string} url - Registry URL to check.
+ * @returns {boolean} true if it matches the official npm registry.
+ */
+function isOfficialRegistry(url) {
+  const normalized = url.replace(/\/+$/, '').toLowerCase();
+  return normalized === 'https://registry.npmjs.org';
+}
+
+/**
+ * Recursively collect non-official registry hostnames from lockfile `resolved` URLs.
+ *
+ * @param {object} obj - The lockfile data (or a sub-object).
+ * @param {Set<string>} hosts - Set to collect non-official hostnames into.
+ */
+function collectResolvedUrls(obj, hosts) {
+  if (!obj || typeof obj !== 'object') return;
+
+  if (typeof obj.resolved === 'string') {
+    try {
+      const u = new URL(obj.resolved);
+      const host = u.hostname.toLowerCase();
+      if (host !== 'registry.npmjs.org') {
+        hosts.add(host);
+      }
+    } catch {
+      // Malformed URL — skip
+    }
+  }
+
+  // Recurse into packages (lockfile v2/v3) and dependencies (lockfile v1)
+  if (obj.packages && typeof obj.packages === 'object') {
+    for (const val of Object.values(obj.packages)) {
+      collectResolvedUrls(val, hosts);
+    }
+  }
+  if (obj.dependencies && typeof obj.dependencies === 'object') {
+    for (const val of Object.values(obj.dependencies)) {
+      collectResolvedUrls(val, hosts);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  SBOM (Software Bill of Materials) — CycloneDX format
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2331,7 +2555,8 @@ const VEX_SEVERITY_MAP = {
   LOCKFILE: 'high',
   C2: 'critical',
   TEAMPCP: 'critical',
-  OUTDATED: 'medium'
+  OUTDATED: 'medium',
+  REGISTRY: 'high'
 };
 
 /**
@@ -2411,7 +2636,7 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps };
+module.exports = { check, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  8. Provenance Verification — "Shadow Execution" Detection
