@@ -23,6 +23,7 @@ npx @sathyendra/security-checker
 ```bash
 sec-check               # Read-only scan — prints Diagnostic Report only
 sec-check --fix         # Print report, then auto-remediate fixable threats
+sec-check --json        # Output machine-readable JSON (for dashboards / VEX reports)
 sec-check --update-db   # Fetch latest IOC database from trusted source
 sec-check --help        # Show usage information
 ```
@@ -79,6 +80,51 @@ Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifa
 | Python stager detection | Flags suspicious `.py` files in Node.js project roots that contain backdoor-like patterns (subprocess, socket, exec, base64) |
 | Malicious .pth files | Scans Python `site-packages` (system + local venvs) for `.pth` files with executable `import` lines containing base64, subprocess, exec/eval, or network calls — the "importless" execution technique used by TeamPCP. Only triggered when a Python dependency file (requirements.txt, Pipfile, etc.) is present |
 | Provenance verification | Checks high-profile packages (axios, lodash, express, etc.) for npm provenance attestations. Flags “Suspicious: Manual Publish Detected” when a popular package is published without a CI/CD pipeline link or GitHub repository — a sign of stolen npm token usage |
+## Machine-Readable JSON Output
+
+Use `--json` to output structured results suitable for security dashboards, CI/CD artifact collection, and VEX (Vulnerability Exploitability eXchange) report generation:
+
+```bash
+sec-check --json
+```
+
+Example output:
+
+```json
+{
+  "threats": [
+    {
+      "message": "CRITICAL: plain-crypto-js detected in node_modules",
+      "category": "CRITICAL",
+      "fixable": true,
+      "fixDescription": "npm uninstall plain-crypto-js"
+    }
+  ],
+  "summary": {
+    "total": 1,
+    "fixable": 1,
+    "manual": 0,
+    "clean": false
+  },
+  "metadata": {
+    "tool": "@sathyendra/security-checker",
+    "version": "1.9.0",
+    "timestamp": "2025-06-09T12:00:00.000Z",
+    "project": "my-app",
+    "platform": "win32",
+    "node": "v22.0.0"
+  }
+}
+```
+
+The exit code follows the same convention: `0` when clean, `1` when threats are found. Combine with `--fix` to also run auto-remediation before outputting JSON.
+
+Pipe to your VEX toolchain:
+
+```bash
+sec-check --json > scan-results.json
+sec-check --json | jq '.threats[] | select(.category == "CRITICAL")'
+```
 ## Dynamic IOC Updates
 
 TeamPCP is known for rapidly rotating C2 domains and typosquatting new package names. Instead of waiting for a full npm release, you can fetch the latest Indicators of Compromise (IOCs) on demand:

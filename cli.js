@@ -27,6 +27,9 @@ Usage: sec-check [options]
 Options:
   --fix         Auto-remediate fixable threats after showing the Diagnostic Report.
                 Without this flag the tool is strictly read-only.
+  --json        Output results as machine-readable JSON instead of the human-readable
+                Diagnostic Report. Suitable for CI/CD pipelines, security dashboards,
+                and VEX (Vulnerability Exploitability eXchange) report generation.
   --update-db   Fetch the latest IOC (Indicators of Compromise) database from a
                 trusted remote source. The fetched data is cached locally at
                 ${getDbPath()}
@@ -62,15 +65,22 @@ Exit codes:
   }
 
   const fix = args.includes('--fix');
+  const jsonMode = args.includes('--json');
 
   try {
-    // Run security checks; returns true if any threats were found.
-    // The Diagnostic Report is always printed first.
+    // Run security checks; returns true/false when json=false, structured object when json=true.
+    // The Diagnostic Report is always printed first (suppressed in JSON mode).
     // When --fix is passed, fixable threats are auto-remediated after the report.
-    const threatsFound = await check({ fix });
+    const result = await check({ fix, json: jsonMode });
 
-    // Exit with code 1 if threats were found, 0 if clean
-    process.exit(threatsFound ? 1 : 0);
+    if (jsonMode) {
+      // Machine-readable output to stdout — suitable for piping to dashboards / VEX generators
+      console.log(JSON.stringify(result, null, 2));
+      process.exit(result.summary.clean ? 0 : 1);
+    } else {
+      // Exit with code 1 if threats were found, 0 if clean
+      process.exit(result ? 1 : 0);
+    }
   } catch (err) {
     // Handle unexpected errors gracefully
     console.error('❌ Security check failed:', err.message);

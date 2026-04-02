@@ -246,10 +246,13 @@ function isSafePackageName(name) {
  *
  * @param {object} [options]
  * @param {boolean} [options.fix=false] - When true, attempt auto-remediation of fixable threats after showing the report.
- * @returns {Promise<boolean>} true if one or more threats were detected (after fixes), false if clean.
+ * @param {boolean} [options.json=false] - When true, suppress human-readable output and return a structured result object.
+ * @returns {Promise<boolean|object>} When json=false: true if threats detected, false if clean.
+ *   When json=true: { threats, summary, metadata } object for machine consumption.
  */
 async function check(options = {}) {
   const fix = options.fix || false;
+  const jsonMode = options.json || false;
   const threats = [];
   const sys = os.platform();
 
@@ -366,12 +369,46 @@ async function check(options = {}) {
 
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
-  printDiagnosticReport(threats, fix);
+  if (!jsonMode) {
+    printDiagnosticReport(threats, fix);
+  }
 
   // ── Auto-remediation (only when --fix is passed) ───────────────────────
   // The tool is read-only by default. Fixes are opt-in and non-destructive.
   if (fix && threats.some(t => t.fixable)) {
     await runFixes(threats);
+  }
+
+  // ── JSON mode: return structured result object ─────────────────────────
+  if (jsonMode) {
+    const pkg = (() => {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
+      } catch { return {}; }
+    })();
+    const fixableCount = threats.filter(t => t.fixable).length;
+    return {
+      threats: threats.map(t => ({
+        message: t.message,
+        category: t.category,
+        fixable: t.fixable,
+        fixDescription: t.fixDescription || null
+      })),
+      summary: {
+        total: threats.length,
+        fixable: fixableCount,
+        manual: threats.length - fixableCount,
+        clean: threats.length === 0
+      },
+      metadata: {
+        tool: '@sathyendra/security-checker',
+        version: require('./package.json').version,
+        timestamp: new Date().toISOString(),
+        project: pkg.name || path.basename(process.cwd()),
+        platform: sys,
+        node: process.version
+      }
+    };
   }
 
   return threats.length > 0;
