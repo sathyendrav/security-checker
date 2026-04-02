@@ -1,7 +1,7 @@
 {
   "name": "@sathyendra/security-checker",
-  "version": "1.0.1",
-  "description": "Security scanner for npm projects: detects malicious packages, high-severity vulnerabilities, RAT artifacts, and C2 domain indicators",
+  "version": "1.5.1",
+  "description": "Security scanner for npm projects: diagnostic reports, --fix auto-remediation, provenance verification, TeamPCP/WAVESHAPER detection, malicious npm & PyPI packages, dropper packages, decoy swaps, integrity mismatches, and C2 indicators",
   "main": "check.js",
   "bin": {
     "sec-check": "cli.js"
@@ -15,7 +15,17 @@
     "vulnerability",
     "npm-audit",
     "rat-detection",
-    "supply-chain"
+    "supply-chain",
+    "lockfile-audit",
+    "dropper-detection",
+    "integrity-check",
+    "decoy-swap",
+    "teampcp",
+    "waveshaper",
+    "cross-ecosystem",
+    "pypi-security",
+    "provenance",
+    "shadow-execution"
   ],
   "author": "sathyendra",
   "license": "MIT",

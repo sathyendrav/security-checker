@@ -1,6 +1,6 @@
 # @sathyendra/security-checker
 
-A lightweight, zero-dependency security scanner for npm projects. Detects malicious packages, high/critical vulnerabilities, RAT artifacts, and C2 domain indicators — before they can execute.
+A lightweight, zero-dependency security scanner for npm projects. Detects malicious packages, high/critical vulnerabilities, dropper packages, decoy swap attacks, integrity mismatches, TeamPCP/WAVESHAPER artifacts, cross-ecosystem (PyPI) threats, provenance violations, and C2 domain indicators — before they can execute.
 
 ## Why this exists
 
@@ -21,12 +21,46 @@ npx @sathyendra/security-checker
 ## CLI Usage
 
 ```bash
-sec-check
+sec-check            # Read-only scan — prints Diagnostic Report only
+sec-check --fix      # Print report, then auto-remediate fixable threats
+sec-check --help     # Show usage information
 ```
 
 **Exit codes:**
 - `0` — No threats detected (clean)
 - `1` — One or more threats found (CI will fail)
+
+## Trust & Read-Only by Default
+
+The tool **never modifies** your project unless you explicitly pass `--fix`. Every scan prints a **Diagnostic Report** first, showing all findings with `[FIXABLE]` or `[MANUAL]` tags so you know exactly what will happen before any action is taken.
+
+```
+──────────────────────────────────────────────────────────────────────
+  @sathyendra/security-checker — Diagnostic Report
+──────────────────────────────────────────────────────────────────────
+  🚨 CRITICAL: plain-crypto-js detected in node_modules  [FIXABLE]
+  🚨 PROVENANCE: "axios@1.7.0" — Manual Publish Detected   [MANUAL]
+──────────────────────────────────────────────────────────────────────
+  2 threat(s) found | 1 fixable | 1 require manual review
+  Run with --fix to auto-remediate fixable threats.
+──────────────────────────────────────────────────────────────────────
+```
+
+### What `--fix` can remediate
+
+| Threat | Fix action |
+|---|---|
+| Malicious npm packages | `npm uninstall <package>` |
+| npm audit vulnerabilities | `npm audit fix` |
+| Lockfile malicious packages | `npm uninstall <package>` |
+| Dropper packages | `npm uninstall <package>` * |
+| Integrity mismatches | `npm ci` (clean reinstall) |
+| Swap artifacts (package.md, .bak) | Delete the artifact file |
+| Mtime anomalies | `npm install <package>` (reinstall) * |
+
+\* Package names are validated against npm naming rules before being passed to shell commands. If a lockfile contains a suspiciously crafted name (possible command injection), the threat is downgraded to `[MANUAL]`.
+
+Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifacts, C2 hosts entries, PyPI packages, Python stagers, provenance issues.
 
 ## What it checks
 
@@ -34,12 +68,19 @@ sec-check
 |---|---|
 | Malicious packages | Detects known bad packages (e.g. `plain-crypto-js`) in `node_modules` |
 | npm audit | Flags high and critical severity vulnerabilities |
-| RAT artifacts | Scans OS-specific paths for Remote Access Trojan drop indicators (requires admin/root) |
-| C2 hosts | Checks the system hosts file for known C2 domain indicators (`sfrclak.com`) |
+| Deep lockfile audit | Recursively scans `package-lock.json` / `yarn.lock` for known malicious packages in the full dependency tree |
+| Dropper detection | Flags packages that have `postinstall`/`preinstall` scripts but contain no real source code — a hallmark of supply-chain droppers |
+| Integrity checksums | Compares installed package hashes against `package-lock.json` and the npm registry to detect post-install tampering or lockfile manipulation |
+| Decoy swap detection | Detects backup artifacts (`package.md`, `.bak`, `.orig`) and `package.json` modification time anomalies — the exact anti-forensic trick used in the Axios attack |
+| TeamPCP / WAVESHAPER | Scans for RAT drop artifacts, persistence mechanisms (scheduled tasks, LaunchAgents, systemd units), and Python backdoor stagers across Windows, macOS, and Linux (requires admin/root) |
+| C2 domains | Checks the system hosts file for all known TeamPCP C2 domain indicators (7 domains tracked) |
+| Cross-ecosystem (PyPI) | Scans `requirements.txt`, `Pipfile`, and `Pipfile.lock` for known malicious PyPI packages from the same TeamPCP campaign (LiteLLM, Telnyx, Trivy, KICS variants) |
+| Python stager detection | Flags suspicious `.py` files in Node.js project roots that contain backdoor-like patterns (subprocess, socket, exec, base64) |
+| Provenance verification | Checks high-profile packages (axios, lodash, express, etc.) for npm provenance attestations. Flags “Suspicious: Manual Publish Detected” when a popular package is published without a CI/CD pipeline link or GitHub repository — a sign of stolen npm token usage |
 
 ## Permissions
 
-RAT artifact detection requires **admin** (Windows) or **root** (Unix/macOS). Without elevated permissions the tool still runs but emits a warning and skips RAT path checks to avoid false negatives silently passing.
+TeamPCP/WAVESHAPER artifact detection requires **admin** (Windows) or **root** (Unix/macOS). Without elevated permissions the tool still runs all other checks but emits a warning and skips system-level artifact scans.
 
 ## Use in CI/CD
 
