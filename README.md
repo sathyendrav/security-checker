@@ -24,6 +24,7 @@ npx @sathyendra/security-checker
 sec-check               # Read-only scan — prints Diagnostic Report only
 sec-check --fix         # Print report, then auto-remediate fixable threats
 sec-check --pre         # Preinstall mode: lockfile + environment scan (no node_modules needed)
+sec-check --init        # Auto-configure package.json with preinstall & secure-install scripts
 sec-check --shield      # Zero Trust Shield: pre-flight → isolated install → post-vetting
 sec-check --shield --fix # Shield mode with auto-remediation in post-vetting stage
 sec-check --json        # Output machine-readable JSON (for dashboards / VEX reports)
@@ -132,6 +133,41 @@ Example output:
 ──────────────────────────────────────────────────────────────────────
 
   ✅ Preinstall checks passed — safe to proceed with npm install
+```
+
+## Auto-Setup (`--init`)
+
+Automatically configure your `package.json` with security scripts in one command:
+
+```bash
+sec-check --init
+```
+
+This adds the following scripts:
+
+```json
+{
+  "scripts": {
+    "preinstall": "sec-check --pre",
+    "secure-install": "npm install --ignore-scripts && sec-check"
+  }
+}
+```
+
+| Script | Purpose |
+|---|---|
+| `preinstall` | Runs automatically before every `npm install` — scans the lockfile and environment for threats before any packages are downloaded |
+| `secure-install` | Manual alternative to `npm install` — downloads packages with scripts disabled, then runs a full security scan |
+
+Existing scripts are **never overwritten**. If a script already exists, `--init` will skip it and show what it wanted to add so you can merge manually.
+
+Example output:
+
+```
+✅ Added the following scripts to package.json:
+
+   "preinstall": "sec-check --pre"
+   "secure-install": "npm install --ignore-scripts && sec-check"
 ```
 
 ## Zero Trust Shield (`--shield`)

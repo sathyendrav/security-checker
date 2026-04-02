@@ -3295,7 +3295,7 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, shield, preinstall, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment };
+module.exports = { check, shield, preinstall, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow
@@ -3778,6 +3778,92 @@ async function preinstall(options = {}, _testData) {
       node: process.version
     }
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Init Shield — automatic package.json configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Scripts that `--init` will add to the user's package.json.
+ * Keys are npm script names, values are the commands.
+ */
+const INIT_SCRIPTS = {
+  preinstall: 'sec-check --pre',
+  'secure-install': 'npm install --ignore-scripts && sec-check'
+};
+
+/**
+ * Automatically configure the user's package.json with security scripts.
+ *
+ * Adds the following npm scripts:
+ *   - "preinstall": "sec-check --pre"        (lockfile + env scan before install)
+ *   - "secure-install": "npm install --ignore-scripts && sec-check"
+ *                                             (isolated install + full scan)
+ *
+ * Existing scripts are NOT overwritten — the user is told which scripts were
+ * skipped so they can merge them manually.
+ *
+ * @param {object} [_testData] - Optional test injection.
+ * @param {string} [_testData.projectDir] - Override project directory (default: process.cwd()).
+ * @param {boolean} [_testData.dryRun] - If true, do not write changes — return the result only.
+ * @returns {object} Result: { ok, added[], skipped[], pkg (after), error? }.
+ */
+function initShield(_testData) {
+  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : process.cwd();
+  const pkgPath = path.join(projectDir, 'package.json');
+  const dryRun = _testData && _testData.dryRun;
+
+  // ── Read package.json ────────────────────────────────────────────────
+  if (!fs.existsSync(pkgPath)) {
+    return { ok: false, added: [], skipped: [], error: 'No package.json found in the current directory.' };
+  }
+
+  let raw;
+  try {
+    raw = fs.readFileSync(pkgPath, 'utf8');
+  } catch (err) {
+    return { ok: false, added: [], skipped: [], error: `Cannot read package.json: ${err.message}` };
+  }
+
+  let pkg;
+  try {
+    pkg = JSON.parse(raw);
+  } catch (err) {
+    return { ok: false, added: [], skipped: [], error: `package.json is not valid JSON: ${err.message}` };
+  }
+
+  // ── Ensure scripts section exists ────────────────────────────────────
+  if (!pkg.scripts || typeof pkg.scripts !== 'object') {
+    pkg.scripts = {};
+  }
+
+  const added = [];
+  const skipped = [];
+
+  for (const [name, cmd] of Object.entries(INIT_SCRIPTS)) {
+    if (pkg.scripts[name]) {
+      skipped.push({ name, existing: pkg.scripts[name], wanted: cmd });
+    } else {
+      pkg.scripts[name] = cmd;
+      added.push({ name, cmd });
+    }
+  }
+
+  // ── Write back ──────────────────────────────────────────────────────
+  if (added.length > 0 && !dryRun) {
+    // Detect original indentation (default to 2 spaces)
+    const indentMatch = raw.match(/^(\s+)"/m);
+    const indent = indentMatch ? indentMatch[1].length : 2;
+
+    try {
+      fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, indent) + '\n', 'utf8');
+    } catch (err) {
+      return { ok: false, added: [], skipped, error: `Cannot write package.json: ${err.message}` };
+    }
+  }
+
+  return { ok: true, added, skipped, pkg };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

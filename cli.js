@@ -2,7 +2,7 @@
 'use strict';
 
 // Import the main security scanning logic and IOC database utilities
-const { check, shield, preinstall, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
+const { check, shield, preinstall, initShield, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -15,6 +15,7 @@ const { check, shield, preinstall, updateDb, getDbPath, loadIocDb, formatAsVex, 
  *   sec-check --sbom        Generate a CycloneDX SBOM (Software Bill of Materials).
  *   sec-check --update-db   Fetch the latest IOC database from a trusted source.
  *   sec-check --pre         Preinstall mode: lockfile + environment scan (no node_modules needed).
+ *   sec-check --init        Auto-configure package.json with preinstall & secure-install scripts.
  *   sec-check --shield     Run the Zero Trust Shield: pre-flight → isolated install → post-vetting.
  *   sec-check --help        Show usage information.
  *
@@ -46,6 +47,10 @@ Options:
                 Checks: lockfile integrity, registry config, suspicious env vars,
                 lifecycle script injection, lockfile presence.
                 Combine with --json for machine-readable output.
+  --init        Auto-configure your package.json with security scripts:
+                  "preinstall": "sec-check --pre"  (lockfile + env scan before install)
+                  "secure-install": "npm install --ignore-scripts && sec-check"
+                Existing scripts are never overwritten.
   --shield      Zero Trust Shield mode. Runs a three-stage secure install workflow:
                   Stage 1 — Pre-flight: scan lockfile & config for threats before downloading.
                   Stage 2 — Isolated Install: npm install --ignore-scripts (no lifecycle hooks).
@@ -84,6 +89,32 @@ Exit codes:
       console.error(`❌ Update failed: ${result.message}`);
       process.exit(1);
     }
+  }
+
+  // Handle --init: auto-configure package.json with security scripts
+  if (args.includes('--init')) {
+    const result = initShield();
+    if (!result.ok) {
+      console.error(`❌ ${result.error}`);
+      process.exit(1);
+    }
+    if (result.added.length > 0) {
+      console.log('✅ Added the following scripts to package.json:\n');
+      for (const s of result.added) {
+        console.log(`   "${s.name}": "${s.cmd}"`);
+      }
+    }
+    if (result.skipped.length > 0) {
+      console.log('\n⚠️  Skipped (already defined):');
+      for (const s of result.skipped) {
+        console.log(`   "${s.name}": "${s.existing}"  (wanted: "${s.wanted}")`);
+      }
+    }
+    if (result.added.length === 0 && result.skipped.length > 0) {
+      console.log('\n   All scripts were already configured. No changes made.');
+    }
+    console.log();
+    process.exit(0);
   }
 
   // Handle --sbom: generate CycloneDX SBOM and exit (no security scan)
