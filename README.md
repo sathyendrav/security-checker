@@ -25,6 +25,7 @@ sec-check               # Read-only scan — prints Diagnostic Report only
 sec-check --fix         # Print report, then auto-remediate fixable threats
 sec-check --pre         # Preinstall mode: lockfile + environment scan (no node_modules needed)
 sec-check --init        # Auto-configure package.json with preinstall & secure-install scripts
+sec-check --approve <p> # Add package <p> to approved list (.sec-check-approved.json)
 sec-check --shield      # Zero Trust Shield: pre-flight → isolated install → post-vetting
 sec-check --shield --fix # Shield mode with auto-remediation in post-vetting stage
 sec-check --json        # Output machine-readable JSON (for dashboards / VEX reports)
@@ -95,6 +96,7 @@ Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifa
 | Secrets detection | Scans for `.env` files (`.env`, `.env.production`, `.env.local`, etc.) and hardcoded credentials in source files: `NPM_TOKEN`, AWS keys, GitHub tokens (`ghp_`, `gho_`, `ghs_`, `ghr_`), PEM private keys, `DATABASE_URL`, `API_KEY`, and hardcoded passwords (OWASP A05) |
 | SSRF / C2 blocklist scan | Scans installed packages in `node_modules/` for hardcoded URLs and IP addresses pointing to known C2 / malware infrastructure (OWASP A10). Matches against the full TeamPCP domain blocklist (7+ domains) plus known malicious IPs. Extensible via `--update-db`. Private/loopback IPs are excluded to avoid false positives |
 | Environment check | Scans process environment variables for install-time threats (OWASP A05): `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` (library preload hijacking), `NODE_OPTIONS --require` (module injection), `npm_config_registry` (env-level Dependency Confusion), `NODE_EXTRA_CA_CERTS` (custom CA for MITM), and `http_proxy` / `https_proxy` pointing to non-localhost hosts (proxy MITM risk). Localhost proxies are excluded |
+| Dependency script sandboxing | Scans lifecycle scripts (`preinstall`, `install`, `postinstall`, `preuninstall`, `uninstall`, `postuninstall`, `prepare`) of ALL dependencies in `node_modules/` for risky patterns: `curl`, `wget`, `eval()`, `base64`, `Function()`, `exec()`, `child_process`, `node -e`, `python -c`, pipe-to-shell. Approved packages (`.sec-check-approved.json`) are skipped. Use `sec-check --approve <pkg>` to allowlist vetted packages (OWASP A03) |
 
 ## Preinstall Mode (`--pre`)
 
@@ -168,6 +170,45 @@ Example output:
 
    "preinstall": "sec-check --pre"
    "secure-install": "npm install --ignore-scripts && sec-check"
+```
+
+## Dependency Script Sandboxing (`--approve`)
+
+Step 17 of the full scan automatically scans the `scripts` section of **every dependency** in `node_modules/` for risky patterns in lifecycle hooks (`preinstall`, `install`, `postinstall`, `preuninstall`, `uninstall`, `postuninstall`, `prepare`). Non-auto hooks like `test` and `start` are ignored.
+
+Flagged patterns: `curl`, `wget`, `eval()`, `base64`, `Function()`, `Invoke-WebRequest`, `exec()`, `child_process`, `node -e`, `python -c`, pipe-to-shell (`| sh`, `| bash`).
+
+### Approving packages
+
+When a dependency is flagged, vet it manually and approve it:
+
+```bash
+sec-check --approve husky
+sec-check --approve @scope/my-pkg
+```
+
+Approved packages are stored in `.sec-check-approved.json` (project-local, safe to commit):
+
+```json
+{
+  "approved": ["husky", "@scope/my-pkg"],
+  "approvedAt": {
+    "husky": "2025-01-15T12:00:00.000Z",
+    "@scope/my-pkg": "2025-01-15T12:00:00.000Z"
+  }
+}
+```
+
+Example scan output:
+
+```
+──────────────────────────────────────────────────────────────────────
+  @sathyendra/security-checker — Diagnostic Report
+──────────────────────────────────────────────────────────────────────
+  ⚠️  DEP_SCRIPT: "shady-pkg" has risky lifecycle script(s):
+     "postinstall" (curl, pipe to shell) — vet and run
+     `sec-check --approve shady-pkg` to allowlist (OWASP A03)  [MANUAL]
+──────────────────────────────────────────────────────────────────────
 ```
 
 ## Zero Trust Shield (`--shield`)

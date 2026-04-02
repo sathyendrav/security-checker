@@ -500,6 +500,13 @@ async function check(options = {}) {
   //     URLs directly — this catches them before they can phone home.
   checkSsrfIndicators(threats);
 
+  // 17. Dependency Script Sandboxing (OWASP A03).
+  //     Scans lifecycle scripts of ALL dependencies in node_modules/ for
+  //     risky patterns (curl, wget, eval, base64, etc.).  Packages on the
+  //     project-local approved list (.sec-check-approved.json) are skipped.
+  //     Users vet flagged packages and allowlist them via --approve.
+  checkDependencyScripts(threats);
+
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
   if (!jsonMode) {
@@ -3076,6 +3083,216 @@ function scanContentForSsrf(content, pkgName, filePath, blockedDomains, blockedI
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  17. Dependency Script Sandboxing — Risk Report (OWASP A03)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Default path for the project-local allowlist file.
+ * Stored in the project root so it can be committed to version control,
+ * giving the team a shared record of vetted packages.
+ */
+const APPROVED_FILE = '.sec-check-approved.json';
+
+/**
+ * Load the list of approved (allowlisted) packages from the project root.
+ *
+ * File format: { "approved": ["pkg-a", "@scope/pkg-b"], "approvedAt": { "pkg-a": "2025-01-01T00:00:00.000Z" } }
+ *
+ * @param {string} projectDir - Absolute path to the project root.
+ * @returns {Set<string>} Set of approved package names (lowercase).
+ */
+function loadApprovedPackages(projectDir) {
+  const filePath = path.join(projectDir, APPROVED_FILE);
+  try {
+    if (!fs.existsSync(filePath)) return new Set();
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (Array.isArray(data.approved)) {
+      return new Set(data.approved.map(n => n.toLowerCase()));
+    }
+  } catch {
+    // Corrupted or unreadable — treat as empty
+  }
+  return new Set();
+}
+
+/**
+ * Add a package to the project-local approved list.
+ *
+ * Creates `.sec-check-approved.json` if it doesn't exist, or merges into
+ * the existing file.  Records a timestamp for each approval.
+ *
+ * @param {string} pkgName - Package name to approve (e.g. "husky").
+ * @param {object} [_testData] - Optional test injection.
+ * @param {string} [_testData.projectDir] - Override project directory.
+ * @returns {object} { ok, message, file }
+ */
+function approvePackage(pkgName, _testData) {
+  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : process.cwd();
+  const filePath = path.join(projectDir, APPROVED_FILE);
+
+  if (!pkgName || typeof pkgName !== 'string' || pkgName.trim().length === 0) {
+    return { ok: false, message: 'Package name is required.' };
+  }
+
+  const name = pkgName.trim().toLowerCase();
+
+  // Validate package name format
+  if (!isSafePackageName(name)) {
+    return { ok: false, message: `Invalid package name: "${name}"` };
+  }
+
+  // Load or create data
+  let data = { approved: [], approvedAt: {} };
+  try {
+    if (fs.existsSync(filePath)) {
+      data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (!Array.isArray(data.approved)) data.approved = [];
+      if (!data.approvedAt || typeof data.approvedAt !== 'object') data.approvedAt = {};
+    }
+  } catch {
+    data = { approved: [], approvedAt: {} };
+  }
+
+  // Check if already approved
+  if (data.approved.includes(name)) {
+    return { ok: true, message: `"${name}" is already approved.`, file: filePath };
+  }
+
+  // Add and write
+  data.approved.push(name);
+  data.approvedAt[name] = new Date().toISOString();
+
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  } catch (err) {
+    return { ok: false, message: `Cannot write ${APPROVED_FILE}: ${err.message}` };
+  }
+
+  return { ok: true, message: `"${name}" approved and added to ${APPROVED_FILE}`, file: filePath };
+}
+
+/**
+ * Patterns that flag a dependency's lifecycle script as risky.
+ * Broader than the project-level LIFECYCLE_INJECTION_PATTERNS because
+ * we want to surface ANY script that does non-trivial work — the user
+ * must explicitly approve it with --approve.
+ */
+const DEP_SCRIPT_RISK_PATTERNS = [
+  { pattern: /\bcurl\b/i,                     label: 'curl' },
+  { pattern: /\bwget\b/i,                     label: 'wget' },
+  { pattern: /\beval\s*\(/,                   label: 'eval()' },
+  { pattern: /\bbase64\b/i,                   label: 'base64' },
+  { pattern: /\bFunction\s*\(/,               label: 'Function()' },
+  { pattern: /Invoke-WebRequest\b/i,          label: 'Invoke-WebRequest' },
+  { pattern: /\bexec\s*\(/,                   label: 'exec()' },
+  { pattern: /\bchild_process\b/,             label: 'child_process' },
+  { pattern: /\bnode\s+-e\s/,                 label: 'node -e' },
+  { pattern: /\bpython[23]?\s+-c\s/,          label: 'python -c' },
+  { pattern: /\|\s*(sh|bash|cmd|powershell)\b/i, label: 'pipe to shell' },
+];
+
+/**
+ * Lifecycle hooks that run automatically during install/uninstall.
+ * We only flag these — scripts like "test" or "start" are user-triggered.
+ */
+const DEP_AUTO_HOOKS = [
+  'preinstall', 'install', 'postinstall',
+  'preuninstall', 'uninstall', 'postuninstall',
+  'prepare'
+];
+
+/**
+ * Scan all dependencies in node_modules for lifecycle scripts containing
+ * suspicious patterns.  Packages on the approved list are skipped.
+ *
+ * This is the "Script Sandboxing" analysis (OWASP A03) — it generates a
+ * Risk Report telling the user which dependencies want to run code during
+ * install.  The user can vet each package and approve it with
+ * `sec-check --approve <pkg>`.
+ *
+ * @param {object[]} threats - Array to push structured threat objects into.
+ * @param {object} [_testData] - Optional test injection.
+ * @param {object} [_testData.depScripts] - Map of { pkgName: { hook: cmd } } to simulate.
+ * @param {string[]} [_testData.approved] - Simulated approved package list.
+ */
+function checkDependencyScripts(threats, _testData) {
+  const projectDir = process.cwd();
+  const nodeModulesDir = path.join(projectDir, 'node_modules');
+
+  // Build approved set
+  const approved = _testData && _testData.approved
+    ? new Set(_testData.approved.map(n => n.toLowerCase()))
+    : loadApprovedPackages(projectDir);
+
+  // Get dependency scripts (real or injected)
+  let depMap; // { pkgName: { hook: cmd, ... }, ... }
+
+  if (_testData && _testData.depScripts) {
+    depMap = _testData.depScripts;
+  } else {
+    depMap = {};
+    if (!fs.existsSync(nodeModulesDir)) return;
+
+    const pkgNames = listInstalledPackages(nodeModulesDir);
+    for (const pkgName of pkgNames) {
+      const pkgJsonPath = path.join(nodeModulesDir, pkgName, 'package.json');
+      try {
+        const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+        if (pkgJson.scripts && typeof pkgJson.scripts === 'object') {
+          const autoScripts = {};
+          for (const hook of DEP_AUTO_HOOKS) {
+            if (pkgJson.scripts[hook] && typeof pkgJson.scripts[hook] === 'string') {
+              autoScripts[hook] = pkgJson.scripts[hook];
+            }
+          }
+          if (Object.keys(autoScripts).length > 0) {
+            depMap[pkgName] = autoScripts;
+          }
+        }
+      } catch {
+        // Unreadable package.json — skip
+      }
+    }
+  }
+
+  // Scan each dependency's scripts for risk patterns
+  for (const [pkgName, hooks] of Object.entries(depMap)) {
+    if (approved.has(pkgName.toLowerCase())) continue;
+
+    const riskEntries = [];
+
+    for (const [hook, cmd] of Object.entries(hooks)) {
+      if (!DEP_AUTO_HOOKS.includes(hook)) continue;
+
+      const matched = [];
+      for (const { pattern, label } of DEP_SCRIPT_RISK_PATTERNS) {
+        if (pattern.test(cmd)) {
+          matched.push(label);
+        }
+      }
+
+      if (matched.length > 0) {
+        riskEntries.push({ hook, patterns: matched, cmd });
+      }
+    }
+
+    if (riskEntries.length > 0) {
+      const hookSummary = riskEntries
+        .map(e => `"${e.hook}" (${e.patterns.join(', ')})`)
+        .join('; ');
+
+      threats.push({
+        message: `DEP_SCRIPT: "${pkgName}" has risky lifecycle script(s): ${hookSummary} — vet and run \`sec-check --approve ${pkgName}\` to allowlist (OWASP A03)`,
+        category: 'DEP_SCRIPT',
+        fixable: false,
+        fixDescription: `sec-check --approve ${pkgName}`,
+        fix: null
+      });
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  SBOM (Software Bill of Materials) — CycloneDX format
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3215,7 +3432,8 @@ const VEX_SEVERITY_MAP = {
   NO_LOCKFILE: 'high',
   SECRETS: 'critical',
   SSRF: 'critical',
-  ENVIRONMENT: 'high'
+  ENVIRONMENT: 'high',
+  DEP_SCRIPT: 'high'
 };
 
 /**
@@ -3295,7 +3513,7 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, shield, preinstall, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment };
+module.exports = { check, shield, preinstall, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow

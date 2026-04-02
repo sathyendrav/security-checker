@@ -2,7 +2,7 @@
 'use strict';
 
 // Import the main security scanning logic and IOC database utilities
-const { check, shield, preinstall, initShield, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
+const { check, shield, preinstall, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -51,6 +51,9 @@ Options:
                   "preinstall": "sec-check --pre"  (lockfile + env scan before install)
                   "secure-install": "npm install --ignore-scripts && sec-check"
                 Existing scripts are never overwritten.
+  --approve <p> Add package <p> to the project-local approved list
+                (.sec-check-approved.json). Approved packages are skipped
+                during Dependency Script Sandboxing (step 17).
   --shield      Zero Trust Shield mode. Runs a three-stage secure install workflow:
                   Stage 1 — Pre-flight: scan lockfile & config for threats before downloading.
                   Stage 2 — Isolated Install: npm install --ignore-scripts (no lifecycle hooks).
@@ -89,6 +92,24 @@ Exit codes:
       console.error(`❌ Update failed: ${result.message}`);
       process.exit(1);
     }
+  }
+
+  // Handle --approve <pkg>: add a package to the approved list
+  if (args.includes('--approve')) {
+    const idx = args.indexOf('--approve');
+    const pkgName = args[idx + 1];
+    if (!pkgName || pkgName.startsWith('--')) {
+      console.error('❌ Usage: sec-check --approve <package-name>');
+      process.exit(1);
+    }
+    const result = approvePackage(pkgName);
+    if (result.ok) {
+      console.log(`✅ ${result.message}`);
+    } else {
+      console.error(`❌ ${result.message}`);
+      process.exit(1);
+    }
+    process.exit(0);
   }
 
   // Handle --init: auto-configure package.json with security scripts

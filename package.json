@@ -1,7 +1,7 @@
 {
   "name": "@sathyendra/security-checker",
-  "version": "1.20.0",
-  "description": "Security scanner for npm projects: Auto-Setup (--init) package.json configuration, Preinstall Mode (--pre) lightweight lockfile & environment scan, Zero Trust Shield (--shield) multi-stage install workflow, diagnostic reports, --fix auto-remediation, --json machine-readable output, --vex-out CycloneDX VEX reports, --sbom CycloneDX SBOM generation, --update-db dynamic IOC updates with Ed25519 signature verification, outdated dependency detection (OWASP A06), registry Dependency Confusion detection (OWASP A08), lifecycle script injection detection (OWASP A03), npm doctor environment checks, lockfile enforcement, secrets detection (OWASP A05), environment variable scanning, C2 domain blocklist / SSRF indicator scanning (OWASP A10), provenance verification, shadow execution detection, TeamPCP/WAVESHAPER detection, malicious npm & PyPI packages, dropper packages, decoy swaps, integrity mismatches, and C2 indicators",
+  "version": "1.21.0",
+  "description": "Security scanner for npm projects: Dependency Script Sandboxing (--approve) for vetting lifecycle scripts of ALL dependencies, Auto-Setup (--init) package.json configuration, Preinstall Mode (--pre) lightweight lockfile & environment scan, Zero Trust Shield (--shield) multi-stage install workflow, diagnostic reports, --fix auto-remediation, --json machine-readable output, --vex-out CycloneDX VEX reports, --sbom CycloneDX SBOM generation, --update-db dynamic IOC updates with Ed25519 signature verification, outdated dependency detection (OWASP A06), registry Dependency Confusion detection (OWASP A08), lifecycle script injection detection (OWASP A03), npm doctor environment checks, lockfile enforcement, secrets detection (OWASP A05), environment variable scanning, C2 domain blocklist / SSRF indicator scanning (OWASP A10), provenance verification, shadow execution detection, TeamPCP/WAVESHAPER detection, malicious npm & PyPI packages, dropper packages, decoy swaps, integrity mismatches, and C2 indicators",
   "main": "check.js",
   "bin": {
     "sec-check": "cli.js"
@@ -43,7 +43,10 @@
     "shield",
     "preinstall",
     "environment-check",
-    "auto-setup"
+    "auto-setup",
+    "script-sandboxing",
+    "dependency-vetting",
+    "approve-allowlist"
   ],
   "author": "sathyendra",
   "license": "MIT",
