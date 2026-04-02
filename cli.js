@@ -2,7 +2,7 @@
 'use strict';
 
 // Import the main security scanning logic and IOC database utilities
-const { check, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
+const { check, shield, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -14,6 +14,7 @@ const { check, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = req
  *   sec-check --vex-out     Output results as a CycloneDX VEX document (spec 1.6).
  *   sec-check --sbom        Generate a CycloneDX SBOM (Software Bill of Materials).
  *   sec-check --update-db   Fetch the latest IOC database from a trusted source.
+ *   sec-check --shield     Run the Zero Trust Shield: pre-flight → isolated install → post-vetting.
  *   sec-check --help        Show usage information.
  *
  * Exit codes:
@@ -39,6 +40,12 @@ Options:
   --sbom        Generate a CycloneDX SBOM (Software Bill of Materials) listing every
                 dependency in the project with name, version, purl, scope, and integrity
                 hashes. Does not run a security scan.
+  --shield      Zero Trust Shield mode. Runs a three-stage secure install workflow:
+                  Stage 1 — Pre-flight: scan lockfile & config for threats before downloading.
+                  Stage 2 — Isolated Install: npm install --ignore-scripts (no lifecycle hooks).
+                  Stage 3 — Post-vetting: full integrity & security scan on downloaded files.
+                Combine with --fix to auto-remediate after post-vetting.
+                Combine with --json for machine-readable stage-by-stage results.
   --update-db   Fetch the latest IOC (Indicators of Compromise) database from a
                 trusted remote source. The fetched data is cached locally at
                 ${getDbPath()}
@@ -87,8 +94,26 @@ Exit codes:
   const fix = args.includes('--fix');
   const jsonMode = args.includes('--json');
   const vexOut = args.includes('--vex-out');
+  const shieldMode = args.includes('--shield');
 
   try {
+    // ── Shield mode: three-stage Zero Trust workflow ─────────────────────
+    if (shieldMode) {
+      const result = await shield({ fix, json: jsonMode || vexOut });
+
+      if (vexOut) {
+        const vexDoc = formatAsVex(result);
+        console.log(JSON.stringify(vexDoc, null, 2));
+        process.exit(result.summary.clean ? 0 : 1);
+      } else if (jsonMode) {
+        console.log(JSON.stringify(result, null, 2));
+        process.exit(result.summary.clean ? 0 : 1);
+      } else {
+        process.exit(result ? 1 : 0);
+      }
+      return;
+    }
+
     // --vex-out implies JSON mode internally (needs the structured result object).
     // In default mode the Diagnostic Report is printed first; in JSON/VEX mode it is suppressed.
     // When --fix is passed, fixable threats are auto-remediated after the report.

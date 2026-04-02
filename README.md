@@ -23,6 +23,8 @@ npx @sathyendra/security-checker
 ```bash
 sec-check               # Read-only scan — prints Diagnostic Report only
 sec-check --fix         # Print report, then auto-remediate fixable threats
+sec-check --shield      # Zero Trust Shield: pre-flight → isolated install → post-vetting
+sec-check --shield --fix # Shield mode with auto-remediation in post-vetting stage
 sec-check --json        # Output machine-readable JSON (for dashboards / VEX reports)
 sec-check --vex-out     # Output CycloneDX VEX document (spec 1.6)
 sec-check --sbom        # Generate CycloneDX SBOM (dependency inventory)
@@ -90,6 +92,69 @@ Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifa
 | Lockfile enforcement | Alerts if the project has no `package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml` — builds without a lockfile are non-deterministic and vulnerable to latest-version poisoning (OWASP A05). Auto-fixable via `npm install --package-lock-only` |
 | Secrets detection | Scans for `.env` files (`.env`, `.env.production`, `.env.local`, etc.) and hardcoded credentials in source files: `NPM_TOKEN`, AWS keys, GitHub tokens (`ghp_`, `gho_`, `ghs_`, `ghr_`), PEM private keys, `DATABASE_URL`, `API_KEY`, and hardcoded passwords (OWASP A05) |
 | SSRF / C2 blocklist scan | Scans installed packages in `node_modules/` for hardcoded URLs and IP addresses pointing to known C2 / malware infrastructure (OWASP A10). Matches against the full TeamPCP domain blocklist (7+ domains) plus known malicious IPs. Extensible via `--update-db`. Private/loopback IPs are excluded to avoid false positives |
+
+## Zero Trust Shield (`--shield`)
+
+The Shield mode replaces the traditional `npm install` → `npm test` workflow with a three-stage defense-in-depth install:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Stage 1 — Pre-flight                                          │
+│  Scan lockfile & config BEFORE any packages are downloaded.    │
+│  Catches: malicious lockfile entries, registry misconfiguration,│
+│  lifecycle script injection, secrets leakage, PyPI threats.    │
+│  ❌ Blocks on: CRITICAL, LOCKFILE (known malware), SECRETS.    │
+├─────────────────────────────────────────────────────────────────┤
+│  Stage 2 — Isolated Install                                    │
+│  npm install --ignore-scripts                                  │
+│  Downloads code to disk WITHOUT executing lifecycle hooks.     │
+│  Blocks dropper-style attacks (e.g. Axios postinstall payload).│
+├─────────────────────────────────────────────────────────────────┤
+│  Stage 3 — Post-vetting                                        │
+│  Full check() scan on the downloaded files.                    │
+│  Integrity verification, SSRF indicators, swap detection,     │
+│  provenance audit, shadow execution, npm doctor, etc.          │
+│  Combine with --fix to auto-remediate fixable threats.         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```bash
+# Basic shield mode — scan, install safely, verify
+sec-check --shield
+
+# Shield with auto-fix — remediate fixable threats in post-vetting
+sec-check --shield --fix
+
+# Shield with JSON output for CI/CD pipelines
+sec-check --shield --json
+```
+
+Example output:
+
+```
+──────────────────────────────────────────────────────────────────────
+  🛡️  @sathyendra/security-checker — Zero Trust Shield
+──────────────────────────────────────────────────────────────────────
+
+  ▸ Stage 1: Pre-flight — scanning lockfile & configuration...
+    ✅ Pre-flight passed — no threats in lockfile or configuration
+
+  ▸ Stage 2: Isolated Install — downloading packages (scripts disabled)...
+    ✅ Packages downloaded with scripts disabled
+
+  ▸ Stage 3: Post-vetting — full integrity & security scan...
+    ✅ Post-vetting passed — all packages verified
+
+──────────────────────────────────────────────────────────────────────
+  🛡️  Shield Summary
+──────────────────────────────────────────────────────────────────────
+  Stage 1 (Pre-flight):    0 threat(s)
+  Stage 2 (Install):       ✅ success
+  Stage 3 (Post-vetting):  0 new threat(s)
+──────────────────────────────────────────────────────────────────────
+  ✅ All stages passed — project is clean
+──────────────────────────────────────────────────────────────────────
+```
 
 ## Machine-Readable JSON Output
 

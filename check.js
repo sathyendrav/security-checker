@@ -3294,10 +3294,281 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators };
+module.exports = { check, shield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  8. Provenance Verification — "Shadow Execution" Detection
+//  Zero Trust Shield — multi-stage install workflow
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Orchestrate a three-stage Zero Trust install workflow.
+ *
+ *   Stage 1 — Pre-flight:  Check the lockfile and project configuration for
+ *     known malicious packages, registry misconfigurations, lifecycle script
+ *     injection, secrets leakage, and missing lockfiles *before* anything is
+ *     downloaded.  If blocking threats are found, abort early.
+ *
+ *   Stage 2 — Isolated Install:  Run `npm install --ignore-scripts` so code
+ *     is downloaded to disk without executing any lifecycle hooks (postinstall,
+ *     preinstall, etc.).  This blocks dropper-style attacks like the Axios
+ *     postinstall payload.
+ *
+ *   Stage 3 — Post-vetting:  Run the full `check({ fix })` scan against the
+ *     downloaded files (integrity, swap detection, SSRF indicators, C2 scans,
+ *     etc.) and optionally auto-remediate fixable threats.
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.fix=false] - Auto-remediate fixable threats in Stage 3.
+ * @param {boolean} [options.json=false] - Return a structured JSON result instead of printing.
+ * @param {object} [_testData] - Optional test injection to avoid real installs.
+ * @param {boolean} [_testData.skipInstall] - Skip the real npm install (for testing).
+ * @param {string} [_testData.installOutput] - Simulated install stdout.
+ * @param {boolean} [_testData.installFails] - Simulate install failure.
+ * @returns {Promise<boolean|object>} Same contract as check(): boolean or structured object.
+ */
+async function shield(options = {}, _testData) {
+  const fix = options.fix || false;
+  const jsonMode = options.json || false;
+  const divider = '─'.repeat(70);
+  const stageThreats = { preflight: [], install: null, postVetting: [] };
+
+  if (!jsonMode) {
+    console.log(`\n${divider}`);
+    console.log('  🛡️  @sathyendra/security-checker — Zero Trust Shield');
+    console.log(divider);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  STAGE 1 — Pre-flight (lockfile + config checks, no node_modules)
+  // ═══════════════════════════════════════════════════════════════════════
+  if (!jsonMode) {
+    console.log('\n  ▸ Stage 1: Pre-flight — scanning lockfile & configuration...');
+  }
+
+  const preflightThreats = [];
+
+  // Lockfile blocklist scan (known malicious packages)
+  deepLockfileAudit(preflightThreats);
+
+  // Registry misconfiguration (Dependency Confusion)
+  checkRegistryConfig(preflightThreats);
+
+  // Lifecycle script injection in the project's own package.json
+  checkLifecycleScripts(preflightThreats);
+
+  // Secrets in project root that could be published
+  checkSecretsLeakage(preflightThreats);
+
+  // Missing lockfile
+  checkLockfilePresence(preflightThreats);
+
+  // Cross-ecosystem (PyPI requirements.txt, Pipfile.lock — no install needed)
+  crossEcosystemScan(preflightThreats);
+
+  stageThreats.preflight = preflightThreats;
+
+  if (!jsonMode) {
+    if (preflightThreats.length === 0) {
+      console.log('    ✅ Pre-flight passed — no threats in lockfile or configuration\n');
+    } else {
+      console.log(`    ⚠️  ${preflightThreats.length} threat(s) found in pre-flight:\n`);
+      for (const t of preflightThreats) {
+        const tag = t.fixable ? '[FIXABLE]' : '[MANUAL]';
+        console.error(`    🚨 ${t.message}  ${tag}`);
+      }
+      console.log();
+    }
+  }
+
+  // Determine if any pre-flight threat is blocking.
+  // CRITICAL, LOCKFILE (known malware in dep tree), and SECRETS are blocking.
+  const blockingCategories = new Set(['CRITICAL', 'LOCKFILE', 'SECRETS']);
+  const hasBlocker = preflightThreats.some(t => blockingCategories.has(t.category));
+
+  if (hasBlocker) {
+    if (!jsonMode) {
+      console.log(`  ✋ Stage 1 BLOCKED — critical threats detected. Resolve them before installing.`);
+      console.log(`${divider}\n`);
+      printDiagnosticReport(preflightThreats, fix);
+      if (fix && preflightThreats.some(t => t.fixable)) {
+        await runFixes(preflightThreats);
+      }
+    }
+
+    if (jsonMode) {
+      return buildShieldResult(stageThreats, 'blocked', fix);
+    }
+    return true; // threats found
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  STAGE 2 — Isolated Install (npm install --ignore-scripts)
+  // ═══════════════════════════════════════════════════════════════════════
+  if (!jsonMode) {
+    console.log('  ▸ Stage 2: Isolated Install — downloading packages (scripts disabled)...');
+  }
+
+  let installOk = true;
+  if (_testData && _testData.skipInstall) {
+    installOk = !_testData.installFails;
+    if (_testData.installOutput && !jsonMode) {
+      console.log(`    ${_testData.installOutput}`);
+    }
+  } else {
+    try {
+      execSync('npm install --ignore-scripts', {
+        encoding: 'utf8',
+        timeout: 120000,
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+    } catch (err) {
+      installOk = false;
+      stageThreats.install = (err.stderr || err.message || 'unknown error').trim();
+    }
+  }
+
+  if (!installOk) {
+    if (!jsonMode) {
+      console.log(`    ❌ npm install --ignore-scripts failed: ${stageThreats.install}`);
+      console.log(`  ✋ Stage 2 FAILED — cannot proceed to post-vetting.`);
+      console.log(`${divider}\n`);
+    }
+    if (jsonMode) {
+      return buildShieldResult(stageThreats, 'install-failed', fix);
+    }
+    return true; // treat install failure as a threat
+  }
+
+  if (!jsonMode) {
+    console.log('    ✅ Packages downloaded with scripts disabled\n');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  STAGE 3 — Post-vetting (full scan + optional auto-fix)
+  // ═══════════════════════════════════════════════════════════════════════
+  if (!jsonMode) {
+    console.log('  ▸ Stage 3: Post-vetting — full integrity & security scan...');
+  }
+
+  // Run the full check() which includes all 16 detection steps.
+  // Combine pre-flight threats with post-vetting threats to avoid duplicates:
+  // check() will re-run some of the same checks (lockfile, registry, etc.) but
+  // that's intentional — the installed state may reveal new issues.
+  const fullResult = await check({ fix, json: true });
+
+  // Separate threats that are NEW (not already found in pre-flight)
+  const preflightMessages = new Set(preflightThreats.map(t => t.message));
+  const newThreats = fullResult.threats.filter(t => !preflightMessages.has(t.message));
+  stageThreats.postVetting = newThreats;
+
+  if (!jsonMode) {
+    const allThreats = [...preflightThreats, ...newThreats];
+
+    if (allThreats.length === 0) {
+      console.log('    ✅ Post-vetting passed — all packages verified\n');
+    } else if (newThreats.length > 0) {
+      console.log(`    ⚠️  ${newThreats.length} new threat(s) found in post-vetting:\n`);
+      for (const t of newThreats) {
+        const tag = t.fixable ? '[FIXABLE]' : '[MANUAL]';
+        console.error(`    🚨 ${t.message}  ${tag}`);
+      }
+      console.log();
+    }
+
+    // Print combined diagnostic report
+    const combinedThreats = allThreats.map(t => {
+      // Reconstruct full threat objects for the report
+      const orig = [...preflightThreats, ...fullResult.threats].find(ft => ft.message === t.message);
+      return orig || t;
+    });
+
+    console.log(`${divider}`);
+    console.log('  🛡️  Shield Summary');
+    console.log(divider);
+    console.log(`  Stage 1 (Pre-flight):    ${preflightThreats.length} threat(s)`);
+    console.log(`  Stage 2 (Install):       ✅ success`);
+    console.log(`  Stage 3 (Post-vetting):  ${newThreats.length} new threat(s)`);
+    console.log(`${divider}`);
+
+    if (combinedThreats.length > 0) {
+      printDiagnosticReport(combinedThreats, fix);
+      if (fix && combinedThreats.some(t => t.fixable)) {
+        await runFixes(combinedThreats);
+      }
+    } else {
+      console.log('  ✅ All stages passed — project is clean');
+      console.log(`${divider}\n`);
+    }
+
+    return allThreats.length > 0;
+  }
+
+  return buildShieldResult(stageThreats, 'complete', fix);
+}
+
+/**
+ * Build a structured JSON result for shield() mode.
+ * @param {object} stageThreats - Threats collected from each stage.
+ * @param {string} outcome - 'blocked' | 'install-failed' | 'complete'.
+ * @param {boolean} fix - Whether --fix was requested.
+ * @returns {object} Structured shield result.
+ */
+function buildShieldResult(stageThreats, outcome, fix) {
+  const allThreats = [
+    ...stageThreats.preflight,
+    ...stageThreats.postVetting
+  ].map(t => ({
+    message: t.message,
+    category: t.category,
+    fixable: t.fixable,
+    fixDescription: t.fixDescription || null
+  }));
+
+  const fixableCount = allThreats.filter(t => t.fixable).length;
+
+  let pkg = {};
+  try { pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')); } catch {}
+
+  return {
+    mode: 'shield',
+    outcome,
+    stages: {
+      preflight: {
+        threats: stageThreats.preflight.map(t => ({
+          message: t.message, category: t.category, fixable: t.fixable,
+          fixDescription: t.fixDescription || null
+        })),
+        passed: stageThreats.preflight.length === 0
+      },
+      install: {
+        passed: outcome !== 'install-failed',
+        error: stageThreats.install || null
+      },
+      postVetting: {
+        threats: stageThreats.postVetting.map(t => ({
+          message: t.message, category: t.category, fixable: t.fixable,
+          fixDescription: t.fixDescription || null
+        })),
+        passed: stageThreats.postVetting.length === 0
+      }
+    },
+    threats: allThreats,
+    summary: {
+      total: allThreats.length,
+      fixable: fixableCount,
+      manual: allThreats.length - fixableCount,
+      clean: allThreats.length === 0
+    },
+    metadata: {
+      tool: '@sathyendra/security-checker',
+      version: require('./package.json').version,
+      timestamp: new Date().toISOString(),
+      project: pkg.name || path.basename(process.cwd()),
+      platform: os.platform(),
+      node: process.version
+    }
+  };
+}
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
