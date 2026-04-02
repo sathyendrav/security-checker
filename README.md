@@ -36,6 +36,7 @@ sec-check --help        # Show usage information
 ```
 
 **Exit codes:**
+
 - `0` — No threats detected (clean)
 - `1` — One or more threats found (CI will fail)
 
@@ -96,7 +97,7 @@ Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifa
 | Secrets detection | Scans for `.env` files (`.env`, `.env.production`, `.env.local`, etc.) and hardcoded credentials in source files: `NPM_TOKEN`, AWS keys, GitHub tokens (`ghp_`, `gho_`, `ghs_`, `ghr_`), PEM private keys, `DATABASE_URL`, `API_KEY`, and hardcoded passwords (OWASP A05) |
 | SSRF / C2 blocklist scan | Scans installed packages in `node_modules/` for hardcoded URLs and IP addresses pointing to known C2 / malware infrastructure (OWASP A10). Matches against the full TeamPCP domain blocklist (7+ domains) plus known malicious IPs. Extensible via `--update-db`. Private/loopback IPs are excluded to avoid false positives |
 | Environment check | Scans process environment variables for install-time threats (OWASP A05): `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` (library preload hijacking), `NODE_OPTIONS --require` (module injection), `npm_config_registry` (env-level Dependency Confusion), `NODE_EXTRA_CA_CERTS` (custom CA for MITM), and `http_proxy` / `https_proxy` pointing to non-localhost hosts (proxy MITM risk). Localhost proxies are excluded |
-| Dependency script sandboxing | Scans lifecycle scripts (`preinstall`, `install`, `postinstall`, `preuninstall`, `uninstall`, `postuninstall`, `prepare`) of ALL dependencies in `node_modules/` for risky patterns: `curl`, `wget`, `eval()`, `base64`, `Function()`, `exec()`, `child_process`, `node -e`, `python -c`, pipe-to-shell. Approved packages (`.sec-check-approved.json`) are skipped. Use `sec-check --approve <pkg>` to allowlist vetted packages (OWASP A03) |
+| Dependency script sandboxing | Scans lifecycle scripts (`preinstall`, `install`, `postinstall`, `preuninstall`, `uninstall`, `postuninstall`, `prepare`) of ALL dependencies in `node_modules/` for risky patterns: `curl`, `wget`, `eval()`, `base64`, `Function()`, `exec()`, `child_process`, `node -e`, `python -c`, pipe-to-shell. Approved packages (`.sec-check-approved.json`) are skipped. Use `sec-check --approve <pkg>` to allowlist vetted packages (OWASP A03) || Lockfile Sentinel | Compares every package's `integrity` hash in `package-lock.json` against a database of known-compromised hashes. Also flags packages with missing integrity hashes — no hash means no tamper detection. Auto-fixable via `npm install --package-lock-only` (OWASP A08) |
 
 ## Preinstall Mode (`--pre`)
 
@@ -111,11 +112,13 @@ sec-check --pre --json
 ```
 
 Checks performed:
+
 1. **Lockfile integrity** — scan `package-lock.json` for known malicious packages
-2. **Registry configuration** — ensure registry is official `registry.npmjs.org` (A08)
+2. **Registry Guard** — ensure registry is official `registry.npmjs.org`, reject HTTP registries (A05/A08)
 3. **Environment** — check for suspicious env vars (`LD_PRELOAD`, proxy MITM, CA injection, `npm_config_registry` override)
-4. **Lifecycle scripts** — flag injection patterns in the project’s `package.json`
+4. **Lifecycle scripts** — flag injection patterns in the project's `package.json`
 5. **Lockfile presence** — warn if no lockfile exists
+6. **Lockfile Sentinel** — compare lockfile hashes against known-compromised database (A08)
 
 Add to your `package.json` to run automatically before every install:
 
@@ -211,6 +214,69 @@ Example scan output:
 ──────────────────────────────────────────────────────────────────────
 ```
 
+## OWASP Risk Mapping
+
+Three consolidated Shield features map directly to OWASP Top 10 risk categories:
+
+| OWASP Risk | Shield Feature | Technical Implementation |
+|---|---|---|
+| A03: Injection | **Script Blocker** | Detects and flags dangerous commands in `package.json` lifecycle hooks before execution |
+| A05: Security Misconfiguration | **Registry Guard** | Rejects the install if a non-official or unencrypted (HTTP) registry is detected in `.npmrc` |
+| A08: Software & Data Integrity Failures | **Lockfile Sentinel** | Compares the lockfile's package hashes against a known "clean" database before `npm install` runs |
+
+All three features are wired into the **Shield pre-flight** (Stage 1) and **Preinstall Mode** (`--pre`). Any finding from these features triggers a blocking exit (`exit 1`).
+
+### Script Blocker (A03: Injection)
+
+Aggregates both **project lifecycle scripts** and **dependency lifecycle scripts** into a single blocking verdict. Internally it runs `checkLifecycleScripts()` (your own `package.json`) and `checkDependencyScripts()` (every package in `node_modules/`).
+
+```js
+const { scriptBlocker } = require('@sathyendra/security-checker');
+const result = scriptBlocker();
+// result.blocked  — true if any injection detected
+// result.threats  — array of threat objects
+// result.summary  — { project: <count>, dependencies: <count> }
+```
+
+Blocked patterns include: `curl | sh`, `wget`, `eval()`, `base64`, `Function()`, `child_process`, `node -e`, `python -c`, and pipe-to-shell constructs.
+
+### Registry Guard (A05: Security Misconfiguration)
+
+Enhanced registry validation that checks **four layers** for non-official or unencrypted (HTTP) registries:
+
+1. **Project `.npmrc`** — scans `<project>/.npmrc` for custom registries
+2. **User `~/.npmrc`** — scans `<home>/.npmrc` for global overrides
+3. **`npm config get registry`** — checks the effective npm configuration
+4. **Lockfile resolved URLs** — scans every `resolved` URL in `package-lock.json` for HTTP hosts
+
+```js
+const { registryGuard } = require('@sathyendra/security-checker');
+const result = registryGuard();
+// result.blocked  — true if any registry misconfiguration detected
+// result.threats  — array of threat objects
+// result.summary  — { nonOfficial: <count>, httpInsecure: <count> }
+```
+
+Any `http://` registry URL is flagged as `REGISTRY_HTTP` (critical) — unencrypted registries allow man-in-the-middle package injection.
+
+### Lockfile Sentinel (A08: Software & Data Integrity Failures)
+
+Parses `package-lock.json` and compares every package's `integrity` hash against a database of known-compromised hashes. Also flags packages with **no integrity hash** (missing hash = no tamper detection).
+
+```js
+const { lockfileSentinel } = require('@sathyendra/security-checker');
+const threats = [];
+lockfileSentinel(threats);
+// threats now contains any LOCKFILE_INTEGRITY findings
+```
+
+The compromised hash database is composed of:
+
+- **Hardcoded baseline** — built into the scanner (empty by default, extensible)
+- **IOC database** — extended via `sec-check --update-db` (the `compromisedHashes` field in `ioc-db.json`)
+
+Findings are auto-fixable via `npm install --package-lock-only` (regenerates the lockfile with fresh hashes from the registry).
+
 ## Zero Trust Shield (`--shield`)
 
 The Shield mode replaces the traditional `npm install` → `npm test` workflow with a three-stage defense-in-depth install:
@@ -220,8 +286,10 @@ The Shield mode replaces the traditional `npm install` → `npm test` workflow w
 │  Stage 1 — Pre-flight                                          │
 │  Scan lockfile & config BEFORE any packages are downloaded.    │
 │  Catches: malicious lockfile entries, registry misconfiguration,│
-│  lifecycle script injection, secrets leakage, PyPI threats.    │
-│  ❌ Blocks on: CRITICAL, LOCKFILE (known malware), SECRETS.    │
+│  lifecycle script injection, secrets leakage, PyPI threats,    │
+│  HTTP registries, compromised lockfile hashes.                 │
+│  ❌ Blocks on: CRITICAL, LOCKFILE, SECRETS, LIFECYCLE_SCRIPT,  │
+│  DEP_SCRIPT, REGISTRY, REGISTRY_HTTP, LOCKFILE_INTEGRITY.      │
 ├─────────────────────────────────────────────────────────────────┤
 │  Stage 2 — Isolated Install                                    │
 │  npm install --ignore-scripts                                  │
@@ -425,6 +493,7 @@ sec-check --update-db
 This fetches a JSON IOC list from a trusted HTTPS source (the [`ioc-db.json`](https://github.com/sathyendrav/axios-security-checker/blob/main/ioc-db.json) file in the maintainer's GitHub repository by default) and caches it locally at `~/.sec-check/ioc-db.json`. On every scan, the cached IOCs are **merged** with the hardcoded baseline — the built-in lists are never replaced or reduced, only extended.
 
 **Security constraints:**
+
 - Only HTTPS URLs are accepted (no HTTP, `file://`, or `data:`)
 - Response size is capped at 512 KB
 - **Ed25519 signature verification** — the fetched `ioc-db.json` must have a matching `.sig` file signed by the maintainer's private key. The public key is hardcoded in the scanner. This prevents a compromised GitHub account from pushing a malicious IOC database that whitelists attacker domains.
@@ -452,6 +521,7 @@ The expected JSON format:
   "maliciousPypiPackages": ["fake-litellm"]
 }
 ```
+
 ## Permissions
 
 TeamPCP/WAVESHAPER artifact detection requires **admin** (Windows) or **root** (Unix/macOS). Without elevated permissions the tool still runs all other checks but emits a warning and skips system-level artifact scans.

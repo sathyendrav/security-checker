@@ -507,6 +507,12 @@ async function check(options = {}) {
   //     Users vet flagged packages and allowlist them via --approve.
   checkDependencyScripts(threats);
 
+  // 18. Lockfile Sentinel — integrity hash verification (OWASP A08).
+  //     Compares every package hash in the lockfile against a known-compromised
+  //     hash database BEFORE npm install runs. Also flags packages with no
+  //     integrity hash (non-deterministic builds vulnerable to MITM).
+  lockfileSentinel(threats);
+
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
   if (!jsonMode) {
@@ -3293,6 +3299,330 @@ function checkDependencyScripts(threats, _testData) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Script Blocker — combined lifecycle + dependency script analysis (A03)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Script Blocker — unified gate for lifecycle script injection (A03).
+ *
+ * Combines two analyses:
+ *   1. Project-level: `checkLifecycleScripts` — scans the project's own
+ *      package.json for injection patterns in lifecycle hooks.
+ *   2. Dependency-level: `checkDependencyScripts` — scans every dependency
+ *      in node_modules for risky auto-hook scripts.
+ *
+ * Returns a structured result with a blocking verdict.  When used in the
+ * shield workflow, any finding blocks the install.
+ *
+ * @param {object} [_testData] - Test injection data.
+ * @param {object} [_testData.scripts] - Override project scripts (for checkLifecycleScripts).
+ * @param {string} [_testData.projectDir] - Override project dir.
+ * @param {object} [_testData.depScripts] - Override dependency scripts (for checkDependencyScripts).
+ * @param {string[]} [_testData.approved] - Override approved packages list.
+ * @returns {{ blocked: boolean, threats: object[], summary: { project: number, dependencies: number } }}
+ */
+function scriptBlocker(_testData) {
+  const projectThreats = [];
+  const depThreats = [];
+
+  checkLifecycleScripts(projectThreats, _testData);
+  checkDependencyScripts(depThreats, _testData);
+
+  const allThreats = [...projectThreats, ...depThreats];
+
+  return {
+    blocked: allThreats.length > 0,
+    threats: allThreats,
+    summary: {
+      project: projectThreats.length,
+      dependencies: depThreats.length
+    }
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Registry Guard — reject non-official & unencrypted registries (A05)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Check if a registry URL uses unencrypted HTTP transport.
+ *
+ * @param {string} url - Registry URL to check.
+ * @returns {boolean} true if the URL uses plain HTTP (not HTTPS).
+ */
+function isHttpRegistry(url) {
+  const trimmed = url.trim().toLowerCase();
+  return trimmed.startsWith('http://');
+}
+
+/**
+ * Registry Guard — blocks install when a non-official or unencrypted
+ * (HTTP) registry is detected in .npmrc or npm config.
+ *
+ * Extends the existing `checkRegistryConfig()` with HTTP detection.
+ * Returns a structured result with a blocking verdict.
+ *
+ * @param {object} [_testData] - Same test injection as checkRegistryConfig.
+ * @returns {{ blocked: boolean, threats: object[], summary: { nonOfficial: number, httpInsecure: number } }}
+ */
+function registryGuard(_testData) {
+  const threats = [];
+
+  // Run existing registry config check (non-official detection)
+  checkRegistryConfig(threats, _testData);
+
+  // Additional HTTP (unencrypted) detection across all layers
+  const httpThreats = [];
+
+  // Layer 1: Project .npmrc
+  const projectNpmrc = _testData
+    ? _testData.projectNpmrc
+    : readFileSafe(path.join(process.cwd(), '.npmrc'));
+
+  if (projectNpmrc) {
+    const reg = extractRegistryFromNpmrc(projectNpmrc);
+    if (reg && isHttpRegistry(reg)) {
+      httpThreats.push({
+        message: `REGISTRY_HTTP: Project .npmrc uses unencrypted HTTP registry ${reg} — credentials and packages can be intercepted (OWASP A05)`,
+        category: 'REGISTRY_HTTP',
+        fixable: false,
+        fixDescription: null,
+        fix: null
+      });
+    }
+  }
+
+  // Layer 2: User ~/.npmrc
+  const userNpmrc = _testData
+    ? _testData.userNpmrc
+    : readFileSafe(path.join(os.homedir(), '.npmrc'));
+
+  if (userNpmrc) {
+    const reg = extractRegistryFromNpmrc(userNpmrc);
+    if (reg && isHttpRegistry(reg)) {
+      httpThreats.push({
+        message: `REGISTRY_HTTP: User ~/.npmrc uses unencrypted HTTP registry ${reg} — credentials and packages can be intercepted (OWASP A05)`,
+        category: 'REGISTRY_HTTP',
+        fixable: false,
+        fixDescription: null,
+        fix: null
+      });
+    }
+  }
+
+  // Layer 3: Effective npm config
+  let npmConfigReg = _testData ? _testData.npmConfigRegistry : null;
+  if (!_testData) {
+    try {
+      npmConfigReg = execSync('npm config get registry', {
+        encoding: 'utf8',
+        timeout: 10000,
+        stdio: ['ignore', 'pipe', 'ignore']
+      }).trim();
+    } catch {
+      // skip
+    }
+  }
+
+  if (npmConfigReg && isHttpRegistry(npmConfigReg)) {
+    httpThreats.push({
+      message: `REGISTRY_HTTP: npm effective registry uses unencrypted HTTP ${npmConfigReg} — credentials and packages can be intercepted (OWASP A05)`,
+      category: 'REGISTRY_HTTP',
+      fixable: false,
+      fixDescription: null,
+      fix: null
+    });
+  }
+
+  // Layer 4: Lockfile resolved URLs with HTTP
+  let lockContent = _testData ? _testData.lockfileContent : null;
+  if (!_testData) {
+    lockContent = readFileSafe(path.join(process.cwd(), 'package-lock.json'));
+  }
+
+  if (lockContent) {
+    let lockData;
+    try { lockData = JSON.parse(lockContent); } catch { lockData = null; }
+
+    if (lockData) {
+      const httpHosts = new Set();
+      collectHttpResolvedUrls(lockData, httpHosts);
+      for (const host of httpHosts) {
+        httpThreats.push({
+          message: `REGISTRY_HTTP: package-lock.json contains HTTP (unencrypted) resolved URLs from ${host} — packages may have been tampered with (OWASP A05)`,
+          category: 'REGISTRY_HTTP',
+          fixable: false,
+          fixDescription: null,
+          fix: null
+        });
+      }
+    }
+  }
+
+  // Deduplicate HTTP threats (same message shouldn't appear from both
+  // the existing checkRegistryConfig and the new HTTP check)
+  const existingMessages = new Set(threats.map(t => t.message));
+  for (const ht of httpThreats) {
+    if (!existingMessages.has(ht.message)) {
+      threats.push(ht);
+    }
+  }
+
+  const nonOfficial = threats.filter(t => t.category === 'REGISTRY').length;
+  const httpInsecure = threats.filter(t => t.category === 'REGISTRY_HTTP').length;
+
+  return {
+    blocked: threats.length > 0,
+    threats,
+    summary: { nonOfficial, httpInsecure }
+  };
+}
+
+/**
+ * Recursively collect hostnames from lockfile `resolved` URLs that use HTTP.
+ *
+ * @param {object} obj - The lockfile data (or sub-object).
+ * @param {Set<string>} hosts - Set to collect HTTP hostnames into.
+ */
+function collectHttpResolvedUrls(obj, hosts) {
+  if (!obj || typeof obj !== 'object') return;
+
+  if (typeof obj.resolved === 'string') {
+    try {
+      const u = new URL(obj.resolved);
+      if (u.protocol === 'http:') {
+        hosts.add(u.hostname.toLowerCase());
+      }
+    } catch {
+      // Malformed URL
+    }
+  }
+
+  if (obj.packages && typeof obj.packages === 'object') {
+    for (const val of Object.values(obj.packages)) {
+      collectHttpResolvedUrls(val, hosts);
+    }
+  }
+  if (obj.dependencies && typeof obj.dependencies === 'object') {
+    for (const val of Object.values(obj.dependencies)) {
+      collectHttpResolvedUrls(val, hosts);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Lockfile Sentinel — integrity hash verification against clean DB (A08)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Known-compromised integrity hashes.
+ *
+ * These are SHA-512 integrity strings extracted from confirmed malicious
+ * package versions. When a lockfile contains one of these hashes, we know
+ * the dependency is a known-compromised version — even before npm install.
+ *
+ * The list is extensible via the IOC database (--update-db). Remote IOC
+ * entries are merged with the hardcoded baseline at runtime.
+ */
+const COMPROMISED_HASHES = [
+  // Placeholder — real hashes will be populated via --update-db
+  // Format: 'sha512-<base64...>'
+];
+
+/**
+ * Get the effective set of compromised hashes (hardcoded + IOC DB).
+ *
+ * @returns {Set<string>} Set of known-compromised integrity hash strings.
+ */
+function getCompromisedHashes() {
+  const hashes = new Set(COMPROMISED_HASHES);
+  const db = loadIocDb();
+  if (db && Array.isArray(db.compromisedHashes)) {
+    for (const h of db.compromisedHashes) {
+      if (typeof h === 'string' && h.startsWith('sha')) {
+        hashes.add(h);
+      }
+    }
+  }
+  return hashes;
+}
+
+/**
+ * Lockfile Sentinel — verify lockfile package hashes against a known-clean
+ * database BEFORE npm install runs.
+ *
+ * This is the "Integrity" pillar of the OWASP A08 mapping. It parses every
+ * integrity hash in the lockfile and:
+ *   1. Flags packages whose integrity hash matches a known-compromised hash
+ *      from the IOC database.
+ *   2. Flags packages with NO integrity hash at all (non-deterministic, can
+ *      be silently replaced by a registry MITM).
+ *
+ * Unlike the post-install integrity check (step 6), this runs BEFORE any
+ * packages are downloaded — it works on the lockfile alone.
+ *
+ * @param {{ message: string, category: string, fixable: boolean, fixDescription: string|null, fix: Function|null }[]} threats
+ * @param {object} [_testData] - Optional test injection.
+ * @param {string} [_testData.lockfileContent] - Simulated lockfile JSON string.
+ * @param {string[]} [_testData.compromisedHashes] - Override compromised hash list.
+ */
+function lockfileSentinel(threats, _testData) {
+  // Load lockfile
+  let lockContent = _testData ? _testData.lockfileContent : null;
+  if (!_testData) {
+    lockContent = readFileSafe(path.join(process.cwd(), 'package-lock.json'));
+  }
+  if (!lockContent) return;
+
+  let lockData;
+  try { lockData = JSON.parse(lockContent); } catch { return; }
+
+  // Get known-compromised hashes
+  const compromised = _testData && _testData.compromisedHashes
+    ? new Set(_testData.compromisedHashes)
+    : getCompromisedHashes();
+
+  // Extract all packages from lockfile
+  const packages = extractPackagesFromLockfile(lockData);
+
+  // Check each package's integrity
+  const missingIntegrity = [];
+
+  for (const pkg of packages) {
+    // Check against compromised hash DB
+    if (pkg.integrity && compromised.size > 0 && compromised.has(pkg.integrity)) {
+      threats.push({
+        message: `LOCKFILE_INTEGRITY: "${pkg.name}@${pkg.version || 'unknown'}" has a known-compromised integrity hash — this exact version was flagged as malicious (OWASP A08)`,
+        category: 'LOCKFILE_INTEGRITY',
+        fixable: true,
+        fixDescription: `npm uninstall ${pkg.name} && npm install ${pkg.name}`,
+        fix: isSafePackageName(pkg.name)
+          ? () => execSync(`npm uninstall ${pkg.name} && npm install ${pkg.name}`, { stdio: 'ignore', timeout: 30000 })
+          : null
+      });
+    }
+
+    // Flag packages with no integrity hash (non-deterministic)
+    if (!pkg.integrity && pkg.name) {
+      missingIntegrity.push(pkg.name);
+    }
+  }
+
+  // Report missing integrity as a single grouped threat (not per-package)
+  if (missingIntegrity.length > 0) {
+    const preview = missingIntegrity.slice(0, 5).join(', ');
+    const more = missingIntegrity.length > 5 ? ` and ${missingIntegrity.length - 5} more` : '';
+    threats.push({
+      message: `LOCKFILE_INTEGRITY: ${missingIntegrity.length} package(s) in lockfile have no integrity hash (${preview}${more}) — run \`npm install --package-lock-only\` to regenerate (OWASP A08)`,
+      category: 'LOCKFILE_INTEGRITY',
+      fixable: true,
+      fixDescription: 'npm install --package-lock-only',
+      fix: () => execSync('npm install --package-lock-only', { stdio: 'ignore', timeout: 30000 })
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  SBOM (Software Bill of Materials) — CycloneDX format
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3433,7 +3763,9 @@ const VEX_SEVERITY_MAP = {
   SECRETS: 'critical',
   SSRF: 'critical',
   ENVIRONMENT: 'high',
-  DEP_SCRIPT: 'high'
+  DEP_SCRIPT: 'high',
+  REGISTRY_HTTP: 'critical',
+  LOCKFILE_INTEGRITY: 'critical'
 };
 
 /**
@@ -3513,7 +3845,7 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, shield, preinstall, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages };
+module.exports = { check, shield, preinstall, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow
@@ -3569,10 +3901,11 @@ async function shield(options = {}, _testData) {
   // Lockfile blocklist scan (known malicious packages)
   deepLockfileAudit(preflightThreats);
 
-  // Registry misconfiguration (Dependency Confusion)
-  checkRegistryConfig(preflightThreats);
+  // Registry Guard: reject non-official + unencrypted HTTP registries (A05)
+  const rgResult = registryGuard(_testData);
+  preflightThreats.push(...rgResult.threats);
 
-  // Lifecycle script injection in the project's own package.json
+  // Script Blocker: lifecycle script injection detection (A03)
   checkLifecycleScripts(preflightThreats);
 
   // Secrets in project root that could be published
@@ -3580,6 +3913,9 @@ async function shield(options = {}, _testData) {
 
   // Missing lockfile
   checkLockfilePresence(preflightThreats);
+
+  // Lockfile Sentinel: integrity hash verification (A08)
+  lockfileSentinel(preflightThreats, _testData);
 
   // Cross-ecosystem (PyPI requirements.txt, Pipfile.lock — no install needed)
   crossEcosystemScan(preflightThreats);
@@ -3601,7 +3937,7 @@ async function shield(options = {}, _testData) {
 
   // Determine if any pre-flight threat is blocking.
   // CRITICAL, LOCKFILE (known malware in dep tree), and SECRETS are blocking.
-  const blockingCategories = new Set(['CRITICAL', 'LOCKFILE', 'SECRETS']);
+  const blockingCategories = new Set(['CRITICAL', 'LOCKFILE', 'SECRETS', 'LIFECYCLE_SCRIPT', 'DEP_SCRIPT', 'REGISTRY', 'REGISTRY_HTTP', 'LOCKFILE_INTEGRITY']);
   const hasBlocker = preflightThreats.some(t => blockingCategories.has(t.category));
 
   if (hasBlocker) {
@@ -3941,8 +4277,9 @@ async function preinstall(options = {}, _testData) {
   // 1. Lockfile integrity (deep audit for known malicious packages)
   deepLockfileAudit(threats);
 
-  // 2. Registry configuration (Dependency Confusion — OWASP A08)
-  checkRegistryConfig(threats, _testData);
+  // 2. Registry Guard — reject non-official + unencrypted HTTP (OWASP A05)
+  const rgResult = registryGuard(_testData);
+  threats.push(...rgResult.threats);
 
   // 3. Environment variables (LD_PRELOAD, proxy, CA certs, npm_config_registry)
   checkEnvironment(threats, _testData);
@@ -3952,6 +4289,9 @@ async function preinstall(options = {}, _testData) {
 
   // 5. Missing lockfile
   checkLockfilePresence(threats, _testData);
+
+  // 6. Lockfile Sentinel — hash verification against clean DB (OWASP A08)
+  lockfileSentinel(threats, _testData);
 
   if (!jsonMode) {
     if (threats.length === 0) {
