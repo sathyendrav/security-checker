@@ -23,6 +23,7 @@ npx @sathyendra/security-checker
 ```bash
 sec-check               # Read-only scan — prints Diagnostic Report only
 sec-check --fix         # Print report, then auto-remediate fixable threats
+sec-check --pre         # Preinstall mode: lockfile + environment scan (no node_modules needed)
 sec-check --shield      # Zero Trust Shield: pre-flight → isolated install → post-vetting
 sec-check --shield --fix # Shield mode with auto-remediation in post-vetting stage
 sec-check --json        # Output machine-readable JSON (for dashboards / VEX reports)
@@ -92,6 +93,46 @@ Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifa
 | Lockfile enforcement | Alerts if the project has no `package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml` — builds without a lockfile are non-deterministic and vulnerable to latest-version poisoning (OWASP A05). Auto-fixable via `npm install --package-lock-only` |
 | Secrets detection | Scans for `.env` files (`.env`, `.env.production`, `.env.local`, etc.) and hardcoded credentials in source files: `NPM_TOKEN`, AWS keys, GitHub tokens (`ghp_`, `gho_`, `ghs_`, `ghr_`), PEM private keys, `DATABASE_URL`, `API_KEY`, and hardcoded passwords (OWASP A05) |
 | SSRF / C2 blocklist scan | Scans installed packages in `node_modules/` for hardcoded URLs and IP addresses pointing to known C2 / malware infrastructure (OWASP A10). Matches against the full TeamPCP domain blocklist (7+ domains) plus known malicious IPs. Extensible via `--update-db`. Private/loopback IPs are excluded to avoid false positives |
+| Environment check | Scans process environment variables for install-time threats (OWASP A05): `LD_PRELOAD` / `DYLD_INSERT_LIBRARIES` (library preload hijacking), `NODE_OPTIONS --require` (module injection), `npm_config_registry` (env-level Dependency Confusion), `NODE_EXTRA_CA_CERTS` (custom CA for MITM), and `http_proxy` / `https_proxy` pointing to non-localhost hosts (proxy MITM risk). Localhost proxies are excluded |
+
+## Preinstall Mode (`--pre`)
+
+A lightweight mode specifically designed for the `preinstall` npm hook. It focuses on the **lockfile** and **environment** rather than `node_modules` (which may not exist yet during `preinstall`).
+
+```bash
+# Run as a standalone pre-check
+sec-check --pre
+
+# Machine-readable output for CI/CD
+sec-check --pre --json
+```
+
+Checks performed:
+1. **Lockfile integrity** — scan `package-lock.json` for known malicious packages
+2. **Registry configuration** — ensure registry is official `registry.npmjs.org` (A08)
+3. **Environment** — check for suspicious env vars (`LD_PRELOAD`, proxy MITM, CA injection, `npm_config_registry` override)
+4. **Lifecycle scripts** — flag injection patterns in the project’s `package.json`
+5. **Lockfile presence** — warn if no lockfile exists
+
+Add to your `package.json` to run automatically before every install:
+
+```json
+{
+  "scripts": {
+    "preinstall": "npx @sathyendra/security-checker --pre"
+  }
+}
+```
+
+Example output:
+
+```
+──────────────────────────────────────────────────────────────────────
+  🛡️  Preinstall Shield — scanning lockfile & environment
+──────────────────────────────────────────────────────────────────────
+
+  ✅ Preinstall checks passed — safe to proceed with npm install
+```
 
 ## Zero Trust Shield (`--shield`)
 

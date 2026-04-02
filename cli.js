@@ -2,7 +2,7 @@
 'use strict';
 
 // Import the main security scanning logic and IOC database utilities
-const { check, shield, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
+const { check, shield, preinstall, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -14,6 +14,7 @@ const { check, shield, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom
  *   sec-check --vex-out     Output results as a CycloneDX VEX document (spec 1.6).
  *   sec-check --sbom        Generate a CycloneDX SBOM (Software Bill of Materials).
  *   sec-check --update-db   Fetch the latest IOC database from a trusted source.
+ *   sec-check --pre         Preinstall mode: lockfile + environment scan (no node_modules needed).
  *   sec-check --shield     Run the Zero Trust Shield: pre-flight → isolated install → post-vetting.
  *   sec-check --help        Show usage information.
  *
@@ -40,6 +41,11 @@ Options:
   --sbom        Generate a CycloneDX SBOM (Software Bill of Materials) listing every
                 dependency in the project with name, version, purl, scope, and integrity
                 hashes. Does not run a security scan.
+  --pre         Preinstall mode. Lightweight scan for the preinstall hook that checks
+                the lockfile and environment BEFORE npm downloads any packages.
+                Checks: lockfile integrity, registry config, suspicious env vars,
+                lifecycle script injection, lockfile presence.
+                Combine with --json for machine-readable output.
   --shield      Zero Trust Shield mode. Runs a three-stage secure install workflow:
                   Stage 1 — Pre-flight: scan lockfile & config for threats before downloading.
                   Stage 2 — Isolated Install: npm install --ignore-scripts (no lifecycle hooks).
@@ -94,9 +100,27 @@ Exit codes:
   const fix = args.includes('--fix');
   const jsonMode = args.includes('--json');
   const vexOut = args.includes('--vex-out');
+  const preMode = args.includes('--pre');
   const shieldMode = args.includes('--shield');
 
   try {
+    // ── Preinstall mode: lightweight lockfile + environment scan ────────
+    if (preMode) {
+      const result = await preinstall({ json: jsonMode || vexOut });
+
+      if (vexOut) {
+        const vexDoc = formatAsVex(result);
+        console.log(JSON.stringify(vexDoc, null, 2));
+        process.exit(result.summary.clean ? 0 : 1);
+      } else if (jsonMode) {
+        console.log(JSON.stringify(result, null, 2));
+        process.exit(result.summary.clean ? 0 : 1);
+      } else {
+        process.exit(result ? 1 : 0);
+      }
+      return;
+    }
+
     // ── Shield mode: three-stage Zero Trust workflow ─────────────────────
     if (shieldMode) {
       const result = await shield({ fix, json: jsonMode || vexOut });

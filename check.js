@@ -3214,7 +3214,8 @@ const VEX_SEVERITY_MAP = {
   NPM_DOCTOR: 'medium',
   NO_LOCKFILE: 'high',
   SECRETS: 'critical',
-  SSRF: 'critical'
+  SSRF: 'critical',
+  ENVIRONMENT: 'high'
 };
 
 /**
@@ -3294,7 +3295,7 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, shield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators };
+module.exports = { check, shield, preinstall, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow
@@ -3569,6 +3570,216 @@ function buildShieldResult(stageThreats, outcome, fix) {
     }
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Preinstall Mode — lightweight pre-hook scan
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Suspicious environment variables that can compromise an npm install.
+ *
+ * Each entry has:
+ *   - envVar:  the variable name (checked case-sensitively against process.env)
+ *   - check:   function(value) → truthy if suspicious
+ *   - label:   human-readable description of the risk
+ *   - category: threat category for the report
+ */
+const SUSPICIOUS_ENV_CHECKS = [
+  // Library preload hijacking
+  {
+    envVar: 'LD_PRELOAD',
+    check: v => v && v.trim().length > 0,
+    label: 'LD_PRELOAD is set — shared library preload can intercept crypto, network, or file I/O calls',
+    category: 'ENVIRONMENT'
+  },
+  {
+    envVar: 'DYLD_INSERT_LIBRARIES',
+    check: v => v && v.trim().length > 0,
+    label: 'DYLD_INSERT_LIBRARIES is set — macOS library injection can intercept system calls',
+    category: 'ENVIRONMENT'
+  },
+  // NODE_OPTIONS --require injection
+  {
+    envVar: 'NODE_OPTIONS',
+    check: v => v && (/--require\s/.test(v) || /-r\s/.test(v)),
+    label: 'NODE_OPTIONS contains --require — a module is injected before every Node.js process',
+    category: 'ENVIRONMENT'
+  },
+  // npm registry override via env (Dependency Confusion)
+  {
+    envVar: 'npm_config_registry',
+    check: v => v && v.trim().length > 0 && !isOfficialRegistry(v.trim()),
+    label: 'npm_config_registry overrides the package registry via environment — Dependency Confusion risk (OWASP A08)',
+    category: 'ENVIRONMENT'
+  },
+  // Custom CA cert injection (MITM potential)
+  {
+    envVar: 'NODE_EXTRA_CA_CERTS',
+    check: v => v && v.trim().length > 0,
+    label: 'NODE_EXTRA_CA_CERTS is set — custom CA certificates can enable MITM interception of HTTPS traffic',
+    category: 'ENVIRONMENT'
+  }
+];
+
+/**
+ * Proxy environment variables to check. These are examined separately because
+ * we only flag them when they point to non-localhost hosts (corporate proxies
+ * through localhost/127.0.0.1 are common and benign).
+ */
+const PROXY_ENV_VARS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY'];
+
+/**
+ * Check the process environment for variables that could compromise an
+ * npm install (OWASP A05 — Security Misconfiguration).
+ *
+ * This is distinct from checkShadowExecution() which is focused on runtime
+ * threats (suspicious parent processes, LOLBins). checkEnvironment() targets
+ * install-time risks: registry overrides, proxy MITM, CA injection, and
+ * library preload that could affect the install process itself.
+ *
+ * @param {object[]} threats - Array to push structured threat objects into.
+ * @param {object} [_testData] - Optional test injection.
+ * @param {object} [_testData.env] - Mock environment variable map (overrides process.env).
+ */
+function checkEnvironment(threats, _testData) {
+  const env = (_testData && _testData.env) ? _testData.env : process.env;
+
+  // ── Fixed checks (LD_PRELOAD, NODE_OPTIONS, npm_config_registry, etc.) ──
+  for (const rule of SUSPICIOUS_ENV_CHECKS) {
+    const value = env[rule.envVar];
+    if (rule.check(value)) {
+      const safeValue = value.length > 80 ? value.slice(0, 80) + '…' : value;
+      threats.push({
+        message: `ENVIRONMENT: ${rule.label} ("${safeValue}")`,
+        category: 'ENVIRONMENT',
+        fixable: false,
+        fixDescription: `Unset ${rule.envVar} before running npm install`,
+        fix: null
+      });
+    }
+  }
+
+  // ── Proxy variables (only flag non-localhost proxies) ────────────────────
+  for (const varName of PROXY_ENV_VARS) {
+    const value = env[varName];
+    if (!value || value.trim().length === 0) continue;
+
+    try {
+      const proxyUrl = new URL(value.trim().startsWith('http') ? value.trim() : `http://${value.trim()}`);
+      const host = proxyUrl.hostname.toLowerCase();
+      // Localhost proxies are benign (common corporate dev setup)
+      if (host === 'localhost' || host === '127.0.0.1' || host === '::1') continue;
+
+      threats.push({
+        message: `ENVIRONMENT: ${varName} routes traffic through external proxy "${host}" — potential MITM risk during package download`,
+        category: 'ENVIRONMENT',
+        fixable: false,
+        fixDescription: `Verify ${varName} points to a trusted proxy or unset it`,
+        fix: null
+      });
+    } catch {
+      // Malformed proxy URL — flag it as suspicious
+      threats.push({
+        message: `ENVIRONMENT: ${varName} contains malformed proxy URL ("${value.length > 80 ? value.slice(0, 80) + '…' : value}")`,
+        category: 'ENVIRONMENT',
+        fixable: false,
+        fixDescription: `Fix or unset ${varName}`,
+        fix: null
+      });
+    }
+  }
+}
+
+/**
+ * Run a lightweight preinstall scan focused on the lockfile and environment.
+ *
+ * Designed to run as a `preinstall` hook BEFORE `npm install` downloads
+ * any packages.  Does NOT scan `node_modules` (which may not exist yet).
+ *
+ * Checks performed:
+ *   1. Lockfile integrity — scan package-lock.json for known malicious packages
+ *   2. Registry configuration — ensure registry is official npmjs.org (A08)
+ *   3. Environment — check for suspicious env vars (LD_PRELOAD, proxy MITM, etc.)
+ *   4. Lifecycle scripts — flag injection patterns in the project's package.json
+ *   5. Lockfile presence — warn if no lockfile exists
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.json=false] - Return structured JSON instead of printing.
+ * @param {object} [_testData] - Optional test injection (passed through to sub-checks).
+ * @param {object} [_testData.env] - Mock environment variables for checkEnvironment().
+ * @returns {Promise<boolean|object>} boolean in print mode (true=threats), object in JSON mode.
+ */
+async function preinstall(options = {}, _testData) {
+  const jsonMode = options.json || false;
+  const divider = '─'.repeat(70);
+  const threats = [];
+
+  if (!jsonMode) {
+    console.log(`\n${divider}`);
+    console.log('  🛡️  Preinstall Shield — scanning lockfile & environment');
+    console.log(`${divider}\n`);
+  }
+
+  // 1. Lockfile integrity (deep audit for known malicious packages)
+  deepLockfileAudit(threats);
+
+  // 2. Registry configuration (Dependency Confusion — OWASP A08)
+  checkRegistryConfig(threats, _testData);
+
+  // 3. Environment variables (LD_PRELOAD, proxy, CA certs, npm_config_registry)
+  checkEnvironment(threats, _testData);
+
+  // 4. Lifecycle script injection in the project's own package.json
+  checkLifecycleScripts(threats, _testData);
+
+  // 5. Missing lockfile
+  checkLockfilePresence(threats, _testData);
+
+  if (!jsonMode) {
+    if (threats.length === 0) {
+      console.log('  ✅ Preinstall checks passed — safe to proceed with npm install\n');
+    } else {
+      console.log(`  ⚠️  ${threats.length} threat(s) found:\n`);
+      for (const t of threats) {
+        const tag = t.fixable ? '[FIXABLE]' : '[MANUAL]';
+        console.error(`  🚨 ${t.message}  ${tag}`);
+      }
+      console.log();
+      console.log('  ✋ Resolve these issues before running npm install.');
+      console.log(`${divider}\n`);
+    }
+    return threats.length > 0;
+  }
+
+  // JSON mode — return structured result
+  let pkg = {};
+  try { pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')); } catch {}
+
+  return {
+    mode: 'preinstall',
+    threats: threats.map(t => ({
+      message: t.message,
+      category: t.category,
+      fixable: t.fixable,
+      fixDescription: t.fixDescription || null
+    })),
+    summary: {
+      total: threats.length,
+      fixable: threats.filter(t => t.fixable).length,
+      manual: threats.filter(t => !t.fixable).length,
+      clean: threats.length === 0
+    },
+    metadata: {
+      tool: '@sathyendra/security-checker',
+      version: require('./package.json').version,
+      timestamp: new Date().toISOString(),
+      project: pkg.name || path.basename(process.cwd()),
+      platform: os.platform(),
+      node: process.version
+    }
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
