@@ -7,6 +7,224 @@ const os = require('os');
 const https = require('https');
 const crypto = require('crypto');
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  IOC Database — dynamic threat intelligence updates
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Default URL for fetching IOC updates.
+ * Points to the raw ioc-db.json file in the package maintainer's GitHub
+ * repository. Contains three arrays: c2Domains, maliciousNpmPackages,
+ * and maliciousPypiPackages. Users can override this URL by setting the
+ * SEC_CHECK_IOC_URL environment variable.
+ *
+ * Only HTTPS URLs are accepted to prevent MITM attacks on IOC data.
+ */
+const DEFAULT_IOC_URL =
+  'https://raw.githubusercontent.com/sathyendrav/axios-security-checker/main/ioc-db.json';
+
+/**
+ * Path to the local IOC database cache file.
+ * Stored in the user's home directory under .sec-check/ so it persists
+ * across projects and npm installs.
+ *
+ * @returns {string} Absolute path to the IOC cache file.
+ */
+function getDbPath() {
+  return path.join(os.homedir(), '.sec-check', 'ioc-db.json');
+}
+
+/**
+ * Load the cached IOC database from disk.
+ * Returns null if the file doesn't exist or is unreadable.
+ * Validates the structure (must have at least one recognized key).
+ *
+ * @returns {{ c2Domains?: string[], maliciousNpmPackages?: string[], maliciousPypiPackages?: string[], updatedAt?: string } | null}
+ */
+function loadIocDb() {
+  const dbPath = getDbPath();
+  try {
+    if (!fs.existsSync(dbPath)) return null;
+    const data = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+    // Basic structure validation — must be an object with at least one array
+    if (typeof data !== 'object' || data === null) return null;
+    if (!data.c2Domains && !data.maliciousNpmPackages && !data.maliciousPypiPackages) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch the latest IOC database from a remote URL and save it locally.
+ *
+ * Security constraints:
+ *   - Only HTTPS URLs are accepted (no HTTP, no file://, no data:)
+ *   - Maximum response size is 512 KB to prevent abuse
+ *   - Response must be valid JSON with recognized structure
+ *   - Each field (c2Domains, etc.) must be an array of strings
+ *   - Individual entries are validated (domains must look like domains,
+ *     package names must be non-empty lowercase strings)
+ *
+ * @param {string} [url] - URL to fetch from. Defaults to DEFAULT_IOC_URL.
+ * @returns {Promise<{ ok: boolean, message: string, added?: { domains: number, npm: number, pypi: number } }>}
+ */
+function updateDb(url) {
+  const iocUrl = url || process.env.SEC_CHECK_IOC_URL || DEFAULT_IOC_URL;
+
+  // Security: only allow HTTPS
+  if (!iocUrl.startsWith('https://')) {
+    return Promise.resolve({ ok: false, message: 'Refused: only HTTPS URLs are accepted for IOC updates' });
+  }
+
+  return new Promise(resolve => {
+    const req = https.get(iocUrl, { timeout: 15000 }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        resolve({ ok: false, message: `HTTP ${res.statusCode} from IOC source` });
+        return;
+      }
+
+      let body = '';
+      const maxBytes = 512 * 1024; // 512 KB limit
+      res.setEncoding('utf8');
+
+      res.on('data', chunk => {
+        body += chunk;
+        if (body.length > maxBytes) {
+          req.destroy();
+          resolve({ ok: false, message: 'Response exceeded 512 KB limit — aborting' });
+        }
+      });
+
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          const validated = validateIocData(data);
+          if (!validated.ok) {
+            resolve(validated);
+            return;
+          }
+
+          // Write to disk
+          const dbPath = getDbPath();
+          const dbDir = path.dirname(dbPath);
+          if (!fs.existsSync(dbDir)) {
+            fs.mkdirSync(dbDir, { recursive: true });
+          }
+
+          const toSave = {
+            c2Domains: data.c2Domains || [],
+            maliciousNpmPackages: data.maliciousNpmPackages || [],
+            maliciousPypiPackages: data.maliciousPypiPackages || [],
+            updatedAt: new Date().toISOString(),
+            sourceUrl: iocUrl
+          };
+
+          fs.writeFileSync(dbPath, JSON.stringify(toSave, null, 2));
+
+          // Count new entries (not already in hardcoded lists)
+          const newDomains = (toSave.c2Domains).filter(d => !C2_DOMAINS.includes(d)).length;
+          const newNpm = (toSave.maliciousNpmPackages).filter(p => !MALICIOUS_PACKAGES.includes(p)).length;
+          const newPypi = (toSave.maliciousPypiPackages).filter(p => !MALICIOUS_PYPI_PACKAGES.includes(p)).length;
+
+          resolve({
+            ok: true,
+            message: `IOC database updated (${dbPath})`,
+            added: { domains: newDomains, npm: newNpm, pypi: newPypi }
+          });
+        } catch {
+          resolve({ ok: false, message: 'Invalid JSON in IOC response' });
+        }
+      });
+    });
+
+    req.on('error', (err) => resolve({ ok: false, message: `Network error: ${err.message}` }));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, message: 'Request timed out (15s)' }); });
+  });
+}
+
+/**
+ * Validate the structure and content of fetched IOC data.
+ *
+ * Rules:
+ *   - Must be a non-null object
+ *   - Each recognized key must be an array of strings
+ *   - Domain entries must match a basic domain pattern (letters, digits, dots, hyphens)
+ *   - Package name entries must be non-empty lowercase strings
+ *   - Invalid individual entries are silently filtered out (doesn't reject the whole payload)
+ *
+ * @param {object} data - Parsed JSON from the IOC source.
+ * @returns {{ ok: boolean, message: string }}
+ */
+function validateIocData(data) {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    return { ok: false, message: 'IOC data must be a JSON object' };
+  }
+
+  const domainPattern = /^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$/i;
+  const pkgNamePattern = /^(@[a-z0-9\-~][a-z0-9\-._~]*\/)?[a-z0-9\-~][a-z0-9\-._~]*$/;
+
+  // Validate and filter domain entries
+  if (data.c2Domains) {
+    if (!Array.isArray(data.c2Domains)) {
+      return { ok: false, message: 'c2Domains must be an array' };
+    }
+    data.c2Domains = data.c2Domains.filter(d => typeof d === 'string' && domainPattern.test(d));
+  }
+
+  // Validate and filter npm package entries
+  if (data.maliciousNpmPackages) {
+    if (!Array.isArray(data.maliciousNpmPackages)) {
+      return { ok: false, message: 'maliciousNpmPackages must be an array' };
+    }
+    data.maliciousNpmPackages = data.maliciousNpmPackages.filter(
+      p => typeof p === 'string' && pkgNamePattern.test(p)
+    );
+  }
+
+  // Validate and filter PyPI package entries
+  if (data.maliciousPypiPackages) {
+    if (!Array.isArray(data.maliciousPypiPackages)) {
+      return { ok: false, message: 'maliciousPypiPackages must be an array' };
+    }
+    data.maliciousPypiPackages = data.maliciousPypiPackages.filter(
+      p => typeof p === 'string' && p.length > 0 && p.length < 200
+    );
+  }
+
+  return { ok: true, message: 'valid' };
+}
+
+/**
+ * Get the effective (merged) IOC lists — hardcoded baseline + cached remote IOCs.
+ *
+ * The hardcoded lists are ALWAYS included. Remote IOC entries are appended
+ * (deduplicated) so the scanner never loses built-in coverage even if the
+ * cache file is deleted or corrupted.
+ *
+ * @returns {{ c2Domains: string[], maliciousNpmPackages: string[], maliciousPypiPackages: string[] }}
+ */
+function getEffectiveIocs() {
+  const db = loadIocDb();
+  if (!db) {
+    return {
+      c2Domains: [...C2_DOMAINS],
+      maliciousNpmPackages: [...MALICIOUS_PACKAGES],
+      maliciousPypiPackages: [...MALICIOUS_PYPI_PACKAGES]
+    };
+  }
+
+  // Merge: hardcoded + remote, deduplicated
+  const merged = {
+    c2Domains: [...new Set([...C2_DOMAINS, ...(db.c2Domains || [])])],
+    maliciousNpmPackages: [...new Set([...MALICIOUS_PACKAGES, ...(db.maliciousNpmPackages || [])])],
+    maliciousPypiPackages: [...new Set([...MALICIOUS_PYPI_PACKAGES, ...(db.maliciousPypiPackages || [])])]
+  };
+
+  return merged;
+}
+
 /**
  * Validate that a package name is safe for use in shell commands.
  * npm package names may only contain URL-safe characters (lowercase letters,
@@ -344,7 +562,8 @@ function checkHostsFile(threats) {
 
   try {
     const hosts = fs.readFileSync(hostsPath, 'utf8');
-    for (const domain of C2_DOMAINS) {
+    const effectiveDomains = getEffectiveIocs().c2Domains;
+    for (const domain of effectiveDomains) {
       if (hosts.includes(domain)) {
         threats.push({
           message: `CRITICAL: known TeamPCP C2 domain "${domain}" found in hosts file`,
@@ -411,7 +630,7 @@ function deepLockfileAudit(threats) {
 
   // Pass 1: Blocklist scan — flag any package whose name is on the known-bad list
   for (const pkg of packages) {
-    if (MALICIOUS_PACKAGES.includes(pkg.name)) {
+    if (getEffectiveIocs().maliciousNpmPackages.includes(pkg.name)) {
       const pkgName = pkg.name;
       threats.push({
         message: `LOCKFILE: known malicious package "${pkgName}" found in dependency tree`,
@@ -750,7 +969,8 @@ function deepYarnLockAudit(threats) {
 
   // yarn.lock entries start with the package name at the beginning of a line,
   // e.g. 'plain-crypto-js@^1.0.0:' or '"@scope/pkg@^1.0.0":'
-  for (const malPkg of MALICIOUS_PACKAGES) {
+  const effectiveNpmPkgs = getEffectiveIocs().maliciousNpmPackages;
+  for (const malPkg of effectiveNpmPkgs) {
     // Match the package name at the start of a line, followed by @ (version) or ","
     const pattern = new RegExp(`^"?${escapeRegex(malPkg)}@`, 'm');
     if (pattern.test(content)) {
@@ -1172,7 +1392,7 @@ function scanRequirementsTxt(cwd, threats) {
 
       // Extract package name (before any version specifier)
       const pkgName = trimmed.split(/[>=<!~\s\[;]/)[0].toLowerCase();
-      if (MALICIOUS_PYPI_PACKAGES.includes(pkgName)) {
+      if (getEffectiveIocs().maliciousPypiPackages.includes(pkgName)) {
         threats.push({
           message: `PYPI: malicious package "${pkgName}" found in ${reqFile}`,
           category: 'PYPI',
@@ -1211,7 +1431,7 @@ function scanPipfile(cwd, threats) {
 
     // Pipfile keys are package names: `litellm-proxy = "*"`
     const pkgName = trimmed.split('=')[0].trim().replace(/"/g, '').toLowerCase();
-    if (MALICIOUS_PYPI_PACKAGES.includes(pkgName)) {
+    if (getEffectiveIocs().maliciousPypiPackages.includes(pkgName)) {
       threats.push({
         message: `PYPI: malicious package "${pkgName}" found in Pipfile`,
         category: 'PYPI',
@@ -1244,7 +1464,7 @@ function scanPipfileLock(cwd, threats) {
   for (const section of sections) {
     if (!lockData[section]) continue;
     for (const pkgName of Object.keys(lockData[section])) {
-      if (MALICIOUS_PYPI_PACKAGES.includes(pkgName.toLowerCase())) {
+      if (getEffectiveIocs().maliciousPypiPackages.includes(pkgName.toLowerCase())) {
         threats.push({
           message: `PYPI: malicious package "${pkgName}" found in Pipfile.lock [${section}]`,
           category: 'PYPI',
@@ -1422,7 +1642,7 @@ async function runFixes(threats) {
   console.log(`${divider}\n`);
 }
 
-module.exports = check;
+module.exports = { check, updateDb, getDbPath, loadIocDb, getEffectiveIocs };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  8. Provenance Verification — "Shadow Execution" Detection

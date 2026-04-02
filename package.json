@@ -1,7 +1,7 @@
 {
   "name": "@sathyendra/security-checker",
-  "version": "1.6.0",
-  "description": "Security scanner for npm projects: diagnostic reports, --fix auto-remediation, provenance verification, TeamPCP/WAVESHAPER detection, malicious npm & PyPI packages, dropper packages, decoy swaps, integrity mismatches, and C2 indicators",
+  "version": "1.7.0",
+  "description": "Security scanner for npm projects: diagnostic reports, --fix auto-remediation, --update-db dynamic IOC updates, provenance verification, TeamPCP/WAVESHAPER detection, malicious npm & PyPI packages, dropper packages, decoy swaps, integrity mismatches, and C2 indicators",
   "main": "check.js",
   "bin": {
     "sec-check": "cli.js"

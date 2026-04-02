@@ -21,9 +21,10 @@ npx @sathyendra/security-checker
 ## CLI Usage
 
 ```bash
-sec-check            # Read-only scan — prints Diagnostic Report only
-sec-check --fix      # Print report, then auto-remediate fixable threats
-sec-check --help     # Show usage information
+sec-check               # Read-only scan — prints Diagnostic Report only
+sec-check --fix         # Print report, then auto-remediate fixable threats
+sec-check --update-db   # Fetch latest IOC database from trusted source
+sec-check --help        # Show usage information
 ```
 
 **Exit codes:**
@@ -73,11 +74,41 @@ Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifa
 | Integrity checksums | Compares installed package hashes against `package-lock.json` and the npm registry to detect post-install tampering or lockfile manipulation |
 | Decoy swap detection | Detects backup artifacts (`package.md`, `.bak`, `.orig`) and `package.json` modification time anomalies — the exact anti-forensic trick used in the Axios attack |
 | TeamPCP / WAVESHAPER | Scans for RAT drop artifacts, persistence mechanisms (scheduled tasks, LaunchAgents, systemd units), and Python backdoor stagers across Windows, macOS, and Linux (requires admin/root) |
-| C2 domains | Checks the system hosts file for all known TeamPCP C2 domain indicators (7 domains tracked) |
+| C2 domains | Checks the system hosts file for all known TeamPCP C2 domain indicators (7+ domains tracked, extensible via `--update-db`) |
 | Cross-ecosystem (PyPI) | Scans `requirements.txt`, `Pipfile`, and `Pipfile.lock` for known malicious PyPI packages from the same TeamPCP campaign (LiteLLM, Telnyx, Trivy, KICS variants) |
 | Python stager detection | Flags suspicious `.py` files in Node.js project roots that contain backdoor-like patterns (subprocess, socket, exec, base64) |
 | Provenance verification | Checks high-profile packages (axios, lodash, express, etc.) for npm provenance attestations. Flags “Suspicious: Manual Publish Detected” when a popular package is published without a CI/CD pipeline link or GitHub repository — a sign of stolen npm token usage |
+## Dynamic IOC Updates
 
+TeamPCP is known for rapidly rotating C2 domains and typosquatting new package names. Instead of waiting for a full npm release, you can fetch the latest Indicators of Compromise (IOCs) on demand:
+
+```bash
+sec-check --update-db
+```
+
+This fetches a JSON IOC list from a trusted HTTPS source (the [`ioc-db.json`](https://github.com/sathyendrav/axios-security-checker/blob/main/ioc-db.json) file in the maintainer's GitHub repository by default) and caches it locally at `~/.sec-check/ioc-db.json`. On every scan, the cached IOCs are **merged** with the hardcoded baseline — the built-in lists are never replaced or reduced, only extended.
+
+**Security constraints:**
+- Only HTTPS URLs are accepted (no HTTP, `file://`, or `data:`)
+- Response size is capped at 512 KB
+- Domain and package name entries are validated before caching
+- Invalid individual entries are silently filtered (don't reject the whole update)
+
+**Override the source URL** by setting the `SEC_CHECK_IOC_URL` environment variable:
+
+```bash
+SEC_CHECK_IOC_URL=https://example.com/my-iocs.json sec-check --update-db
+```
+
+The expected JSON format:
+
+```json
+{
+  "c2Domains": ["evil-domain.com", "another-bad.net"],
+  "maliciousNpmPackages": ["typosquat-axios"],
+  "maliciousPypiPackages": ["fake-litellm"]
+}
+```
 ## Permissions
 
 TeamPCP/WAVESHAPER artifact detection requires **admin** (Windows) or **root** (Unix/macOS). Without elevated permissions the tool still runs all other checks but emits a warning and skips system-level artifact scans.

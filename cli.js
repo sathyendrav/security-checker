@@ -1,19 +1,20 @@
 #!/usr/bin/env node
 'use strict';
 
-// Import the main security scanning logic
-const check = require('./check.js');
+// Import the main security scanning logic and IOC database utilities
+const { check, updateDb, getDbPath, loadIocDb } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
  *
  * Usage:
- *   sec-check          Run a read-only scan and print the Diagnostic Report.
- *   sec-check --fix    Print the report, then auto-remediate fixable threats.
- *   sec-check --help   Show usage information.
+ *   sec-check               Run a read-only scan and print the Diagnostic Report.
+ *   sec-check --fix         Print the report, then auto-remediate fixable threats.
+ *   sec-check --update-db   Fetch the latest IOC database from a trusted source.
+ *   sec-check --help        Show usage information.
  *
  * Exit codes:
- *   0 — No threats detected (clean)
+ *   0 — No threats detected (clean) / update succeeded
  *   1 — Threats found or an error occurred
  */
 async function run() {
@@ -24,15 +25,40 @@ async function run() {
 Usage: sec-check [options]
 
 Options:
-  --fix    Auto-remediate fixable threats after showing the Diagnostic Report.
-           Without this flag the tool is strictly read-only.
-  --help   Show this help message.
+  --fix         Auto-remediate fixable threats after showing the Diagnostic Report.
+                Without this flag the tool is strictly read-only.
+  --update-db   Fetch the latest IOC (Indicators of Compromise) database from a
+                trusted remote source. The fetched data is cached locally at
+                ${getDbPath()}
+                and merged with the built-in lists on every scan.
+                Override the source URL with SEC_CHECK_IOC_URL env variable.
+  --help        Show this help message.
 
 Exit codes:
-  0  No threats detected
-  1  One or more threats found
+  0  No threats detected / database updated successfully
+  1  One or more threats found / update failed
 `);
     process.exit(0);
+  }
+
+  // Handle --update-db: fetch latest IOCs and exit
+  if (args.includes('--update-db')) {
+    console.log('🔄 Fetching latest IOC database...');
+    const result = await updateDb();
+    if (result.ok) {
+      console.log(`✅ ${result.message}`);
+      if (result.added) {
+        console.log(`   New indicators: ${result.added.domains} domains, ${result.added.npm} npm packages, ${result.added.pypi} PyPI packages`);
+      }
+      const db = loadIocDb();
+      if (db && db.updatedAt) {
+        console.log(`   Last updated: ${db.updatedAt}`);
+      }
+      process.exit(0);
+    } else {
+      console.error(`❌ Update failed: ${result.message}`);
+      process.exit(1);
+    }
   }
 
   const fix = args.includes('--fix');

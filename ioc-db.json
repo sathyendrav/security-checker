@@ -1,0 +1,29 @@
+{
+  "c2Domains": [
+    "sfrclak.com",
+    "cfrclak.com",
+    "actsyncmond.com",
+    "edgeupdater.net",
+    "dbus-notifyd.com",
+    "syncdefaultsd.com",
+    "cache-updater.net"
+  ],
+  "maliciousNpmPackages": [
+    "plain-crypto-js",
+    "flatmap-stream",
+    "event-stream",
+    "ua-parser-js-infected",
+    "rc-compromised",
+    "coa-compromised"
+  ],
+  "maliciousPypiPackages": [
+    "litellm-proxy",
+    "litellm-sdk",
+    "telnyx-sdk",
+    "telnyx-api",
+    "trivy-scanner",
+    "kics-scanner",
+    "aqua-trivy",
+    "litellm-internal"
+  ]
+}
