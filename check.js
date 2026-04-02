@@ -21,7 +21,7 @@ const crypto = require('crypto');
  * Only HTTPS URLs are accepted to prevent MITM attacks on IOC data.
  */
 const DEFAULT_IOC_URL =
-  'https://raw.githubusercontent.com/sathyendrav/axios-security-checker/main/ioc-db.json';
+  'https://raw.githubusercontent.com/sathyendrav/security-checker/main/ioc-db.json';
 
 /**
  * Ed25519 public key for verifying IOC database signatures.
@@ -3818,7 +3818,7 @@ function formatAsVex(jsonResult) {
         id,
         source: {
           name: '@sathyendra/security-checker',
-          url: 'https://github.com/sathyendrav/axios-security-checker'
+          url: 'https://github.com/sathyendrav/security-checker'
         },
         ratings: [
           {

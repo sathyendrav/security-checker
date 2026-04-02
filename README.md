@@ -429,7 +429,7 @@ Example output (truncated):
       "id": "SEC-CHECK-CRITICAL-3f2a1b4c",
       "source": {
         "name": "@sathyendra/security-checker",
-        "url": "https://github.com/sathyendrav/axios-security-checker"
+        "url": "https://github.com/sathyendrav/security-checker"
       },
       "ratings": [{ "severity": "critical", "method": "other" }],
       "description": "CRITICAL: plain-crypto-js detected in node_modules",
@@ -492,7 +492,7 @@ TeamPCP is known for rapidly rotating C2 domains and typosquatting new package n
 sec-check --update-db
 ```
 
-This fetches a JSON IOC list from a trusted HTTPS source (the [`ioc-db.json`](https://github.com/sathyendrav/axios-security-checker/blob/main/ioc-db.json) file in the maintainer's GitHub repository by default) and caches it locally at `~/.sec-check/ioc-db.json`. On every scan, the cached IOCs are **merged** with the hardcoded baseline — the built-in lists are never replaced or reduced, only extended.
+This fetches a JSON IOC list from a trusted HTTPS source (the [`ioc-db.json`](https://github.com/sathyendrav/security-checker/blob/main/ioc-db.json) file in the maintainer's GitHub repository by default) and caches it locally at `~/.sec-check/ioc-db.json`. On every scan, the cached IOCs are **merged** with the hardcoded baseline — the built-in lists are never replaced or reduced, only extended.
 
 **Security constraints:**
 
