@@ -69,7 +69,7 @@ Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifa
 | Malicious packages | Detects known bad packages (e.g. `plain-crypto-js`) in `node_modules` |
 | npm audit | Flags high and critical severity vulnerabilities |
 | Deep lockfile audit | Recursively scans `package-lock.json` / `yarn.lock` for known malicious packages in the full dependency tree |
-| Dropper detection | Flags packages that have `postinstall`/`preinstall` scripts but contain no real source code — a hallmark of supply-chain droppers |
+| Dropper detection | Two-signal analysis: (1) structural — flags packages with `postinstall`/`preinstall` scripts but no real source code; (2) behavioral — analyzes install script content and referenced script files for suspicious patterns like obfuscated network requests (`curl \| sh`, `wget`), sensitive path access (`/etc/hosts`, `%PROGRAMDATA%`), obfuscation (`base64`, `eval`, hex encoding), and `child_process` usage. Legitimate wrappers (e.g., `node-gyp rebuild`) are not flagged |
 | Integrity checksums | Compares installed package hashes against `package-lock.json` and the npm registry to detect post-install tampering or lockfile manipulation |
 | Decoy swap detection | Detects backup artifacts (`package.md`, `.bak`, `.orig`) and `package.json` modification time anomalies — the exact anti-forensic trick used in the Axios attack |
 | TeamPCP / WAVESHAPER | Scans for RAT drop artifacts, persistence mechanisms (scheduled tasks, LaunchAgents, systemd units), and Python backdoor stagers across Windows, macOS, and Linux (requires admin/root) |

@@ -509,10 +509,28 @@ function walkV1Dependencies(deps, results) {
  * Heuristic: determine if a package in node_modules is a likely "dropper."
  *
  * A dropper package has install lifecycle scripts but ships with no meaningful
- * source code. We check:
- *   1. Does the package directory exist?
- *   2. Does it contain any .js/.ts/.mjs/.cjs files beyond index.js?
- *   3. Is the main entry file (if any) suspiciously small (< 50 bytes)?
+ * source code — or its install scripts contain suspicious patterns that indicate
+ * malicious intent (network fetching, obfuscation, sensitive path access).
+ *
+ * Two-signal analysis:
+ *   Signal 1 — Structural: Does the package lack real source code?
+ *     1. Does the package directory exist?
+ *     2. Does it contain any .js/.ts/.mjs/.cjs files beyond index.js?
+ *     3. Is the main entry file (if any) suspiciously small (< 50 bytes)?
+ *
+ *   Signal 2 — Behavioral: Do the install scripts contain suspicious patterns?
+ *     - Obfuscated network requests (curl, wget, Invoke-WebRequest piped to shell)
+ *     - Access to sensitive system paths (/etc/hosts, %PROGRAMDATA%, %APPDATA%)
+ *     - Obfuscation techniques (base64 decode, eval, hex-encoded strings)
+ *     - Remote code execution (pipe to sh/bash/cmd/powershell, node -e)
+ *
+ * A package is flagged as a dropper only if:
+ *   - It has no source code AND suspicious script patterns, OR
+ *   - It has no source code at all (zero files), OR
+ *   - It has source code but its install scripts contain multiple suspicious patterns
+ *
+ * This reduces false positives from legitimate "wrapper" packages (e.g., native
+ * addon builders like node-gyp, or platform-specific binary installers).
  *
  * Scoped packages (e.g., @scope/pkg) are resolved to node_modules/@scope/pkg.
  *
@@ -555,15 +573,135 @@ function isLikelyDropper(nodeModulesDir, pkgName) {
     return null;
   }
 
-  // Heuristic thresholds for dropper detection
+  // Analyze install script content for suspicious patterns
+  const scriptAnalysis = analyzeInstallScripts(pkgDir, pkgJson);
+
+  // Decision logic: combine structural + behavioral signals
+  if (sourceFileCount === 0 && scriptAnalysis) {
+    // No source code AND suspicious scripts — strongest dropper signal
+    return `contains no source files and ${scriptAnalysis}`;
+  }
   if (sourceFileCount === 0) {
+    // No source code at all — suspicious regardless of script content
     return 'contains no source files (possible shell dropper)';
   }
+  if (sourceFileCount === 1 && totalSourceBytes < 50 && scriptAnalysis) {
+    // Trivial stub + suspicious scripts — very likely a dropper
+    return `contains only a trivial stub file (< 50 bytes) and ${scriptAnalysis}`;
+  }
   if (sourceFileCount === 1 && totalSourceBytes < 50) {
+    // Trivial stub without suspicious scripts — might be a legitimate wrapper,
+    // still worth flagging but lower confidence
     return 'contains only a trivial stub file (< 50 bytes of code)';
+  }
+  if (scriptAnalysis && scriptAnalysis.includes('multiple')) {
+    // Has source code but install scripts contain multiple suspicious patterns —
+    // legitimate packages almost never do this
+    return `has source code but ${scriptAnalysis}`;
   }
 
   return null;
+}
+
+/**
+ * Suspicious patterns found in dropper install scripts.
+ *
+ * Each pattern targets a specific attack technique used in real supply-chain
+ * compromises (Axios, event-stream, ua-parser-js, TeamPCP campaigns):
+ *
+ *   - Network fetching: curl/wget/Invoke-WebRequest piped to a shell
+ *   - Sensitive paths: /etc/hosts, %PROGRAMDATA%, %APPDATA%, ~/.ssh
+ *   - Obfuscation: base64 decode, hex strings, Buffer.from, eval
+ *   - Remote execution: piping to sh/bash/cmd/powershell, node -e
+ */
+const DROPPER_SCRIPT_PATTERNS = [
+  // ── Network fetch + execute (the classic dropper pattern) ──────────────
+  /\bcurl\b.*\|\s*(sh|bash|node)\b/i,          // curl ... | sh
+  /\bwget\b.*\|\s*(sh|bash|node)\b/i,          // wget ... | sh
+  /\bcurl\b.*-[so]\s/i,                        // curl -s or curl -o (silent download)
+  /\bwget\b.*-[qO]\s/i,                        // wget -q or wget -O (quiet download)
+  /Invoke-WebRequest\b/i,                      // PowerShell web fetch
+  /\bhttp\.get\b|\bhttps\.get\b/i,             // Node.js native HTTP fetch in script
+  /\bfetch\s*\(\s*['"]https?:/i,               // fetch() with URL literal
+
+  // ── Sensitive system path access ───────────────────────────────────────
+  /\/etc\/hosts\b/,                             // Hosts file manipulation (C2 redirect)
+  /%PROGRAMDATA%/i,                             // Windows ProgramData (RAT drop location)
+  /%APPDATA%/i,                                 // Windows AppData (persistence location)
+  /~\/\.ssh\b|\.ssh\/id_rsa/,                   // SSH key theft
+  /\/etc\/shadow\b/,                            // Linux password database
+  /\/etc\/passwd\b/,                            // Linux user database
+
+  // ── Obfuscation techniques ─────────────────────────────────────────────
+  /\bbase64\b.*\b(decode|--decode|-d)\b/i,      // base64 decode on CLI
+  /Buffer\.from\(.*,\s*['"]base64['"]\)/,       // Node.js base64 decode
+  /\batob\s*\(/,                                // Browser/Node atob decode
+  /\\x[0-9a-f]{2}\\x[0-9a-f]{2}\\x[0-9a-f]{2}/i, // Hex-encoded strings (3+ consecutive)
+  /\beval\s*\(/,                                // eval() — dynamic code execution
+  /\bFunction\s*\(/,                            // Function() constructor — eval equivalent
+
+  // ── Remote code execution via shell ────────────────────────────────────
+  /\|\s*(bash|sh|cmd|powershell|pwsh)\b/i,      // Pipe to shell interpreter
+  /\bnode\s+-e\s/,                              // node -e (inline code execution)
+  /\bpython[23]?\s+-c\s/,                       // python -c (inline Python execution)
+  /require\s*\(\s*['"]child_process['"]\s*\)/,   // Importing child_process in install script
+  /\.exec\s*\(|\.execSync\s*\(/,                // child_process exec/execSync call
+];
+
+/**
+ * Analyze install script content for suspicious patterns.
+ *
+ * Examines the raw script commands from package.json (preinstall, install,
+ * postinstall) plus any script files they reference (e.g., "node install.js").
+ * Checks against DROPPER_SCRIPT_PATTERNS for known attack techniques.
+ *
+ * @param {string} pkgDir - Absolute path to the package directory.
+ * @param {object} pkgJson - Parsed package.json of the package.
+ * @returns {string|null} Description of suspicious patterns found, or null if clean.
+ */
+function analyzeInstallScripts(pkgDir, pkgJson) {
+  if (!pkgJson.scripts) return null;
+
+  const scriptKeys = ['preinstall', 'install', 'postinstall'];
+  let allScriptContent = '';
+
+  for (const key of scriptKeys) {
+    const script = pkgJson.scripts[key];
+    if (!script) continue;
+
+    // Collect the raw script command itself
+    allScriptContent += script + '\n';
+
+    // If the script references a local file (e.g., "node install.js", "sh setup.sh"),
+    // read that file's content for deeper analysis
+    const fileRef = script.match(/\b(?:node|sh|bash)\s+([^\s;&|]+)/);
+    if (fileRef && fileRef[1]) {
+      const refPath = path.join(pkgDir, fileRef[1]);
+      try {
+        if (fs.existsSync(refPath)) {
+          allScriptContent += fs.readFileSync(refPath, 'utf8') + '\n';
+        }
+      } catch {
+        // File unreadable — skip
+      }
+    }
+  }
+
+  if (!allScriptContent.trim()) return null;
+
+  // Match against dropper patterns
+  const matched = [];
+  for (const pattern of DROPPER_SCRIPT_PATTERNS) {
+    if (pattern.test(allScriptContent)) {
+      matched.push(pattern.source.replace(/\\b/g, '').replace(/\\/g, '').substring(0, 30));
+    }
+  }
+
+  if (matched.length === 0) return null;
+  if (matched.length === 1) {
+    return `install script contains suspicious pattern (${matched[0]})`;
+  }
+  return `install scripts contain multiple suspicious patterns (${matched.length} found)`;
 }
 
 /**
