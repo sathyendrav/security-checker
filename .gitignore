@@ -24,3 +24,4 @@ Thumbs.db
 # Snyk
 .dcignore
 .github/copilot-instructions.md
+docs/

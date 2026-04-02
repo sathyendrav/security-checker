@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / false-positive discussion
+    url: https://github.com/sathyendrav/security-checker/discussions
+    about: Ask questions or discuss detection results here, not in issues.
+  - name: Security vulnerability report
+    url: https://github.com/sathyendrav/security-checker/security/advisories/new
+    about: Report a vulnerability in this package privately via GitHub Security Advisories.

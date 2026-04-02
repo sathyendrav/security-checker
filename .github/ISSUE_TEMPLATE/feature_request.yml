@@ -1,0 +1,41 @@
+name: Feature Request
+description: Suggest a new detection module or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping make `@sathyendra/security-checker` better.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What threat or gap does this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe the detection logic, files checked, or behaviour you'd like to see.
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: >
+        Links to malware samples, CVEs, threat intelligence reports, or prior art
+        that motivate this feature (optional).
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This can be implemented with zero new runtime dependencies
+        - label: This works on all three platforms (Windows, macOS, Linux)
+        - label: I am willing to submit a pull request for this

@@ -1,0 +1,71 @@
+name: Bug Report
+description: Report a bug or incorrect detection result
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in as much detail as possible.
+
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: Output of `npx @sathyendra/security-checker --version` or check `package.json`
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      placeholder: "20.x"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `sec-check` in a project with ...
+        2. See error / wrong result
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Actual output
+      description: Paste the full terminal output (redact any secrets)
+      render: shell
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched for existing issues
+          required: true
+        - label: This is not a false-positive question (use Discussions for those)
+          required: true
