@@ -1,0 +1,7 @@
+# Exclude everything by default; only publish what's in package.json "files"
+docs/
+test/
+.github/
+.vscode/
+*.md
+!README.md

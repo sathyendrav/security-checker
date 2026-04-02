@@ -1,0 +1,34 @@
+{
+  "name": "@sathyendra/security-checker",
+  "version": "1.0.0",
+  "description": "Security scanner for npm projects: detects malicious packages, high-severity vulnerabilities, RAT artifacts, and C2 domain indicators",
+  "main": "check.js",
+  "bin": {
+    "sec-check": "cli.js"
+  },
+  "scripts": {
+    "preinstall": "node cli.js",
+    "test": "node test/simulate-malware.js"
+  },
+  "keywords": [
+    "security",
+    "malware",
+    "vulnerability",
+    "npm-audit",
+    "rat-detection",
+    "supply-chain"
+  ],
+  "author": "sathyendra",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "check.js",
+    "cli.js",
+    "README.md"
+  ]
+}
