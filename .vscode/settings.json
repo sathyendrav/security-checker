@@ -9,5 +9,6 @@
     },
     "files.exclude": {
         "node_modules": true
-    }
+    },
+    "snyk.advanced.organization": "36e91120-36dc-47fa-87ba-2c741875cc67"
 }

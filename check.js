@@ -466,6 +466,15 @@ async function check(options = {}) {
   //     lockfile resolved URLs for non-official registry hosts.
   checkRegistryConfig(threats);
 
+  // 12. Lifecycle script injection detection (A03 — Injection).
+  //     Scans the project's own package.json lifecycle hooks (postinstall,
+  //     prestart, etc.) for suspicious commands: network piping (curl | sh),
+  //     sensitive path access (/etc/hosts, %PROGRAMDATA%), obfuscation
+  //     (base64, eval), and remote code execution patterns. Unlike step 5
+  //     (dropper detection on dependencies), this targets the project itself.
+  //     Recommendation: use `npm install --ignore-scripts` during vetting.
+  checkLifecycleScripts(threats);
+
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
   if (!jsonMode) {
@@ -2423,6 +2432,130 @@ function collectResolvedUrls(obj, hosts) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  12. Lifecycle Script Injection Detection (OWASP A03)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Lifecycle script hooks that attackers inject malicious commands into.
+ * These run automatically during npm install / npm publish / npm start.
+ */
+const LIFECYCLE_HOOKS = [
+  'preinstall', 'install', 'postinstall',
+  'preuninstall', 'uninstall', 'postuninstall',
+  'prepublish', 'prepublishOnly', 'prepare', 'prepack', 'postpack',
+  'prestart', 'start', 'poststart',
+  'prestop', 'stop', 'poststop',
+  'pretest', 'test', 'posttest'
+];
+
+/**
+ * Patterns that indicate command/script injection in lifecycle hooks.
+ * Reuses the same attack-technique patterns from DROPPER_SCRIPT_PATTERNS
+ * but applied to the project's own package.json rather than dependencies.
+ */
+const LIFECYCLE_INJECTION_PATTERNS = [
+  // ── Network fetch + execute ────────────────────────────────────────────
+  { pattern: /\bcurl\b.*\|\s*(sh|bash|node)\b/i,  label: 'curl piped to shell' },
+  { pattern: /\bwget\b.*\|\s*(sh|bash|node)\b/i,  label: 'wget piped to shell' },
+  { pattern: /\bcurl\b.*-[so]\s/i,                label: 'curl silent/output download' },
+  { pattern: /\bwget\b.*-[qO]\s/i,                label: 'wget quiet/output download' },
+  { pattern: /Invoke-WebRequest\b/i,              label: 'PowerShell Invoke-WebRequest' },
+
+  // ── Sensitive system path access ───────────────────────────────────────
+  { pattern: /\/etc\/hosts\b/,                     label: '/etc/hosts access' },
+  { pattern: /%PROGRAMDATA%/i,                     label: '%PROGRAMDATA% access' },
+  { pattern: /%APPDATA%/i,                         label: '%APPDATA% access' },
+  { pattern: /~\/\.ssh\b|\.ssh\/id_rsa/,           label: 'SSH key access' },
+  { pattern: /\/etc\/shadow\b/,                    label: '/etc/shadow access' },
+  { pattern: /\/etc\/passwd\b/,                    label: '/etc/passwd access' },
+
+  // ── Obfuscation ────────────────────────────────────────────────────────
+  { pattern: /\bbase64\b.*\b(decode|--decode|-d)\b/i, label: 'base64 decode' },
+  { pattern: /Buffer\.from\(.*,\s*['"]base64['"]\)/,  label: 'Buffer.from base64' },
+  { pattern: /\batob\s*\(/,                            label: 'atob() decode' },
+  { pattern: /\beval\s*\(/,                            label: 'eval()' },
+  { pattern: /\bFunction\s*\(/,                        label: 'Function() constructor' },
+
+  // ── Remote code execution via shell ────────────────────────────────────
+  { pattern: /\|\s*(bash|sh|cmd|powershell|pwsh)\b/i,     label: 'pipe to shell' },
+  { pattern: /\bnode\s+-e\s/,                              label: 'node -e inline execution' },
+  { pattern: /\bpython[23]?\s+-c\s/,                       label: 'python -c inline execution' },
+];
+
+/**
+ * Scan the project's own package.json for lifecycle script injection (OWASP A03).
+ *
+ * Unlike the dropper detection (step 5) which scans dependency packages inside
+ * node_modules, this check targets the **project itself**. An attacker who gains
+ * commit access or submits a PR can inject malicious commands into lifecycle
+ * hooks (postinstall, prestart, etc.) that run automatically.
+ *
+ * For each lifecycle hook, the script content (and any referenced script files)
+ * is matched against LIFECYCLE_INJECTION_PATTERNS. Matches are reported with
+ * the specific hook name and pattern label.
+ *
+ * The recommendation is to use `npm install --ignore-scripts` during the
+ * vetting process to prevent automatic execution of lifecycle hooks.
+ *
+ * @param {{ message: string, category: string, fixable: boolean, fixDescription: string|null, fix: Function|null }[]} threats
+ * @param {object} [_testData] - Optional pre-parsed package.json scripts (for testing only).
+ * @param {string} [_testData.projectDir] - Project directory path (defaults to cwd).
+ * @param {object} [_testData.scripts] - The scripts object from package.json.
+ */
+function checkLifecycleScripts(threats, _testData) {
+  let scripts = _testData ? _testData.scripts : null;
+  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : process.cwd();
+
+  if (!scripts) {
+    try {
+      const pkgJson = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8'));
+      scripts = pkgJson.scripts;
+    } catch {
+      return; // No package.json or unreadable — skip
+    }
+  }
+
+  if (!scripts || typeof scripts !== 'object') return;
+
+  for (const hook of LIFECYCLE_HOOKS) {
+    const cmd = scripts[hook];
+    if (!cmd || typeof cmd !== 'string') continue;
+
+    // Collect all script content: the raw command + any referenced file
+    let content = cmd;
+    const fileRef = cmd.match(/\b(?:node|sh|bash)\s+([^\s;&|]+)/);
+    if (fileRef && fileRef[1]) {
+      const refPath = path.join(projectDir, fileRef[1]);
+      try {
+        if (fs.existsSync(refPath)) {
+          content += '\n' + fs.readFileSync(refPath, 'utf8');
+        }
+      } catch {
+        // File unreadable — skip
+      }
+    }
+
+    // Match against injection patterns
+    const matched = [];
+    for (const { pattern, label } of LIFECYCLE_INJECTION_PATTERNS) {
+      if (pattern.test(content)) {
+        matched.push(label);
+      }
+    }
+
+    if (matched.length > 0) {
+      threats.push({
+        message: `LIFECYCLE_SCRIPT: "${hook}" script contains suspicious pattern(s): ${matched.join(', ')} — use \`npm install --ignore-scripts\` during vetting (OWASP A03)`,
+        category: 'LIFECYCLE_SCRIPT',
+        fixable: false,
+        fixDescription: null,
+        fix: null
+      });
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  SBOM (Software Bill of Materials) — CycloneDX format
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2556,7 +2689,8 @@ const VEX_SEVERITY_MAP = {
   C2: 'critical',
   TEAMPCP: 'critical',
   OUTDATED: 'medium',
-  REGISTRY: 'high'
+  REGISTRY: 'high',
+  LIFECYCLE_SCRIPT: 'high'
 };
 
 /**
@@ -2636,7 +2770,7 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig };
+module.exports = { check, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  8. Provenance Verification — "Shadow Execution" Detection
