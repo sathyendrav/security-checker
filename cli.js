@@ -10,6 +10,7 @@ const { check, updateDb, getDbPath, loadIocDb } = require('./check.js');
  * Usage:
  *   sec-check               Run a read-only scan and print the Diagnostic Report.
  *   sec-check --fix         Print the report, then auto-remediate fixable threats.
+ *   sec-check --json        Output machine-readable JSON (for dashboards / VEX reports).
  *   sec-check --update-db   Fetch the latest IOC database from a trusted source.
  *   sec-check --help        Show usage information.
  *
@@ -69,7 +70,7 @@ Exit codes:
 
   try {
     // Run security checks; returns true/false when json=false, structured object when json=true.
-    // The Diagnostic Report is always printed first (suppressed in JSON mode).
+    // In default mode the Diagnostic Report is printed first; in JSON mode it is suppressed.
     // When --fix is passed, fixable threats are auto-remediated after the report.
     const result = await check({ fix, json: jsonMode });
 

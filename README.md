@@ -79,8 +79,7 @@ Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifa
 | Cross-ecosystem (PyPI) | Scans `requirements.txt`, `Pipfile`, and `Pipfile.lock` for known malicious PyPI packages from the same TeamPCP campaign (LiteLLM, Telnyx, Trivy, KICS variants) |
 | Python stager detection | Flags suspicious `.py` files in Node.js project roots that contain backdoor-like patterns (subprocess, socket, exec, base64) |
 | Malicious .pth files | Scans Python `site-packages` (system + local venvs) for `.pth` files with executable `import` lines containing base64, subprocess, exec/eval, or network calls — the "importless" execution technique used by TeamPCP. Only triggered when a Python dependency file (requirements.txt, Pipfile, etc.) is present |
-| Provenance verification | Checks high-profile packages (axios, lodash, express, etc.) for npm provenance attestations. Flags “Suspicious: Manual Publish Detected” when a popular package is published without a CI/CD pipeline link or GitHub repository — a sign of stolen npm token usage |
-## Machine-Readable JSON Output
+| Provenance verification | Checks high-profile packages (axios, lodash, express, etc.) for npm provenance attestations. Flags “Suspicious: Manual Publish Detected” when a popular package is published without a CI/CD pipeline link or GitHub repository — a sign of stolen npm token usage |## Machine-Readable JSON Output
 
 Use `--json` to output structured results suitable for security dashboards, CI/CD artifact collection, and VEX (Vulnerability Exploitability eXchange) report generation:
 
@@ -125,6 +124,7 @@ Pipe to your VEX toolchain:
 sec-check --json > scan-results.json
 sec-check --json | jq '.threats[] | select(.category == "CRITICAL")'
 ```
+
 ## Dynamic IOC Updates
 
 TeamPCP is known for rapidly rotating C2 domains and typosquatting new package names. Instead of waiting for a full npm release, you can fetch the latest Indicators of Compromise (IOCs) on demand:

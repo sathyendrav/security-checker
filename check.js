@@ -241,8 +241,9 @@ function isSafePackageName(name) {
 /**
  * Main security scan entry point.
  * Runs all detection modules sequentially and collects threats.
- * Always prints a Diagnostic Report. The tool is read-only by default —
- * no files or packages are modified unless options.fix is true.
+ * Prints a Diagnostic Report unless json mode is enabled. The tool is
+ * read-only by default — no files or packages are modified unless
+ * options.fix is true.
  *
  * @param {object} [options]
  * @param {boolean} [options.fix=false] - When true, attempt auto-remediation of fixable threats after showing the report.
