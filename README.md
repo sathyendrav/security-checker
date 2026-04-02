@@ -1,5 +1,12 @@
 # @sathyendra/security-checker
 
+[![npm version](https://img.shields.io/npm/v/@sathyendra/security-checker)](https://www.npmjs.com/package/@sathyendra/security-checker)
+[![license](https://img.shields.io/npm/l/@sathyendra/security-checker)](https://github.com/sathyendrav/axios-security-checker/blob/main/LICENSE)
+[![node](https://img.shields.io/node/v/@sathyendra/security-checker)](https://github.com/sathyendrav/axios-security-checker)
+[![GitHub stars](https://img.shields.io/github/stars/sathyendrav/axios-security-checker)](https://github.com/sathyendrav/axios-security-checker)
+[![GitHub issues](https://img.shields.io/github/issues/sathyendrav/axios-security-checker)](https://github.com/sathyendrav/axios-security-checker/issues)
+[![zero dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](https://github.com/sathyendrav/axios-security-checker)
+
 A lightweight, zero-dependency security scanner for npm projects. Detects malicious packages, high/critical vulnerabilities, outdated dependencies (OWASP A06), dropper packages, decoy swap attacks, integrity mismatches, TeamPCP/WAVESHAPER artifacts, cross-ecosystem (PyPI) threats, provenance violations, and C2 domain indicators — before they can execute. Also generates CycloneDX SBOMs and VEX reports for enterprise supply-chain compliance.
 
 ## Why this exists
