@@ -3,5 +3,6 @@ docs/
 test/
 .github/
 .vscode/
+.dcignore
 *.md
 !README.md
