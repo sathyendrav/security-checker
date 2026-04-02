@@ -86,6 +86,10 @@ Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifa
 | Outdated dependencies | Flags packages where the installed version is one or more major versions behind the latest release (OWASP A06). Major version drift often means the package no longer receives security patches |
 | Registry configuration | Detects Dependency Confusion risks (OWASP A08) by verifying the configured npm registry is the official `https://registry.npmjs.org`. Checks project `.npmrc`, user `~/.npmrc`, `npm config get registry`, and `package-lock.json` resolved URLs for non-official registry hosts |
 | Lifecycle script injection | Scans the project's own `package.json` lifecycle hooks (`postinstall`, `preinstall`, `prestart`, etc.) for command injection patterns (OWASP A03): `curl \| sh`, `wget`, sensitive path access (`/etc/hosts`, `%APPDATA%`, `%PROGRAMDATA%`), obfuscation (`base64`, `eval`), and remote code execution. Recommends `npm install --ignore-scripts` during vetting |
+| npm doctor | Runs `npm doctor` and flags failing checks — permission issues in `node_modules`, cache corruption, unreachable registry, missing `git` (OWASP A05) |
+| Lockfile enforcement | Alerts if the project has no `package-lock.json`, `yarn.lock`, or `pnpm-lock.yaml` — builds without a lockfile are non-deterministic and vulnerable to latest-version poisoning (OWASP A05). Auto-fixable via `npm install --package-lock-only` |
+| Secrets detection | Scans for `.env` files (`.env`, `.env.production`, `.env.local`, etc.) and hardcoded credentials in source files: `NPM_TOKEN`, AWS keys, GitHub tokens (`ghp_`, `gho_`, `ghs_`, `ghr_`), PEM private keys, `DATABASE_URL`, `API_KEY`, and hardcoded passwords (OWASP A05) |
+| SSRF / C2 blocklist scan | Scans installed packages in `node_modules/` for hardcoded URLs and IP addresses pointing to known C2 / malware infrastructure (OWASP A10). Matches against the full TeamPCP domain blocklist (7+ domains) plus known malicious IPs. Extensible via `--update-db`. Private/loopback IPs are excluded to avoid false positives |
 
 ## Machine-Readable JSON Output
 

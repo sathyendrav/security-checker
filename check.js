@@ -475,6 +475,31 @@ async function check(options = {}) {
   //     Recommendation: use `npm install --ignore-scripts` during vetting.
   checkLifecycleScripts(threats);
 
+  // 13. npm doctor — environment health check (A05 — Security Misconfiguration).
+  //     Runs `npm doctor` and flags any failing checks (permission issues,
+  //     cache corruption, unreachable registry). These misconfigurations can
+  //     lead to privilege escalation or cache poisoning.
+  checkNpmDoctor(threats);
+
+  // 14. Lockfile enforcement (A05 — Security Misconfiguration).
+  //     Alerts if the project has no package-lock.json, yarn.lock, or
+  //     pnpm-lock.yaml. Without a lockfile, builds are non-deterministic
+  //     and vulnerable to "latest version" poisoning.
+  checkLockfilePresence(threats);
+
+  // 15. Secrets detection (A05 — Security Misconfiguration).
+  //     Scans for .env files and hardcoded credentials (NPM_TOKEN,
+  //     AWS keys, GitHub tokens, PEM private keys, passwords) in
+  //     project-root source files that could be accidentally published.
+  checkSecretsLeakage(threats);
+
+  // 16. SSRF indicator detection (A10 — Server-Side Request Forgery).
+  //     Scans installed packages in node_modules/ for hardcoded URLs and
+  //     IP addresses pointing to known C2 / malware infrastructure.
+  //     While SSRF is a runtime risk, compromised packages embed callback
+  //     URLs directly — this catches them before they can phone home.
+  checkSsrfIndicators(threats);
+
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
   if (!jsonMode) {
@@ -2556,6 +2581,501 @@ function checkLifecycleScripts(threats, _testData) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  13. npm doctor — Environment Health Check (OWASP A05)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Run `npm doctor` and flag any failing checks.
+ *
+ * npm doctor verifies:
+ *   - npm is able to find the node binary
+ *   - node_modules is not writable by non-owners
+ *   - npm cache exists and is correctly structured
+ *   - npm registry is reachable
+ *   - git is available
+ *
+ * Any line in npm doctor output that contains "not ok" indicates a
+ * misconfiguration that could lead to permission escalation, cache
+ * poisoning, or install failures.
+ *
+ * @param {{ message: string, category: string, fixable: boolean, fixDescription: string|null, fix: Function|null }[]} threats
+ * @param {object} [_testData] - Optional test injection.
+ * @param {string|null} [_testData.doctorOutput] - Simulated npm doctor output text.
+ * @param {boolean} [_testData.doctorFailed] - Whether npm doctor exited with error.
+ */
+function checkNpmDoctor(threats, _testData) {
+  let output = '';
+  let failed = false;
+
+  if (_testData) {
+    output = _testData.doctorOutput || '';
+    failed = !!_testData.doctorFailed;
+  } else {
+    // Only run npm doctor in a real project context (has package.json and node_modules)
+    if (!fs.existsSync(path.join(process.cwd(), 'package.json'))) return;
+    if (!fs.existsSync(path.join(process.cwd(), 'node_modules'))) return;
+
+    try {
+      output = execSync('npm doctor', {
+        encoding: 'utf8',
+        timeout: 30000,
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+    } catch (err) {
+      // npm doctor exits non-zero when checks fail
+      output = (err.stdout || '') + (err.stderr || '');
+      failed = true;
+    }
+  }
+
+  if (!output.trim()) return;
+
+  // Parse npm doctor output format:
+  //   Checking <description>
+  //   Not ok
+  //   <recommendation>
+  //
+  // We track the current check name and capture "Not ok" with its context.
+  const lines = output.split('\n');
+  const issues = [];
+  let currentCheck = '';
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    const checkMatch = /^Checking\s+(.+)/i.exec(trimmed);
+    if (checkMatch) {
+      currentCheck = checkMatch[1];
+      continue;
+    }
+    if (/^not ok$/i.test(trimmed)) {
+      // Next line may contain the recommendation
+      const recommendation = (i + 1 < lines.length) ? lines[i + 1].trim() : '';
+      const desc = currentCheck
+        ? `${currentCheck}${recommendation ? ' — ' + recommendation : ''}`
+        : recommendation || 'unknown check';
+      issues.push(desc);
+    }
+  }
+
+  if (issues.length > 0) {
+    threats.push({
+      message: `NPM_DOCTOR: ${issues.length} npm doctor check(s) failed: ${issues.map(i => i.replace(/^not ok\s*/i, '').trim()).join('; ')} — run \`npm doctor\` for details (OWASP A05)`,
+      category: 'NPM_DOCTOR',
+      fixable: false,
+      fixDescription: null,
+      fix: null
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  14. Lockfile Enforcement (OWASP A05)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Alert if the project is missing a lockfile (package-lock.json or yarn.lock).
+ *
+ * Without a lockfile, `npm install` resolves the latest matching version for
+ * every dependency at install time. This makes builds non-deterministic and
+ * opens the door to "latest version" poisoning: an attacker publishes a
+ * malicious patch release that matches a semver range, and every new install
+ * picks it up automatically.
+ *
+ * A committed lockfile pins exact versions and integrity hashes, ensuring
+ * reproducible builds.
+ *
+ * @param {{ message: string, category: string, fixable: boolean, fixDescription: string|null, fix: Function|null }[]} threats
+ * @param {object} [_testData] - Optional test injection.
+ * @param {string} [_testData.projectDir] - Project directory (defaults to cwd).
+ */
+function checkLockfilePresence(threats, _testData) {
+  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : process.cwd();
+
+  // Only relevant for actual projects (must have package.json)
+  if (!fs.existsSync(path.join(projectDir, 'package.json'))) return;
+  // In integration mode (no _testData), also require node_modules to avoid
+  // false positives in scratch directories that happen to have a package.json.
+  if (!_testData && !fs.existsSync(path.join(projectDir, 'node_modules'))) return;
+
+  const hasNpmLock = fs.existsSync(path.join(projectDir, 'package-lock.json'));
+  const hasYarnLock = fs.existsSync(path.join(projectDir, 'yarn.lock'));
+  const hasPnpmLock = fs.existsSync(path.join(projectDir, 'pnpm-lock.yaml'));
+
+  if (!hasNpmLock && !hasYarnLock && !hasPnpmLock) {
+    threats.push({
+      message: 'NO_LOCKFILE: No package-lock.json, yarn.lock, or pnpm-lock.yaml found — builds are non-deterministic and vulnerable to latest-version poisoning (OWASP A05)',
+      category: 'NO_LOCKFILE',
+      fixable: true,
+      fixDescription: 'npm install --package-lock-only (generates lockfile without modifying node_modules)',
+      fix: () => execSync('npm install --package-lock-only', { stdio: 'ignore', timeout: 60000 })
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  15. Secrets Detection (OWASP A05)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * File patterns that commonly contain secrets. We scan for these at the
+ * project root level (not recursively into node_modules).
+ */
+const SECRET_FILE_PATTERNS = [
+  '.env',
+  '.env.local',
+  '.env.production',
+  '.env.development',
+  '.env.staging',
+  '.env.test',
+  '.npmrc'
+];
+
+/**
+ * Regex patterns for hardcoded credentials/tokens in source files.
+ * Each entry has a pattern and a human-readable label.
+ */
+const SECRET_VALUE_PATTERNS = [
+  { pattern: /NPM_TOKEN\s*=\s*\S+/i,                                 label: 'NPM_TOKEN' },
+  { pattern: /npm_[0-9a-zA-Z]{36}/,                                   label: 'npm automation token' },
+  { pattern: /\bAWS_SECRET_ACCESS_KEY\s*=\s*\S+/i,                    label: 'AWS_SECRET_ACCESS_KEY' },
+  { pattern: /\bAWS_ACCESS_KEY_ID\s*=\s*\S+/i,                        label: 'AWS_ACCESS_KEY_ID' },
+  { pattern: /\bGITHUB_TOKEN\s*=\s*\S+/i,                             label: 'GITHUB_TOKEN' },
+  { pattern: /\bghp_[0-9a-zA-Z]{36,}/,                                label: 'GitHub personal access token' },
+  { pattern: /\bgho_[0-9a-zA-Z]{36,}/,                                label: 'GitHub OAuth token' },
+  { pattern: /\bghs_[0-9a-zA-Z]{36,}/,                                label: 'GitHub server-to-server token' },
+  { pattern: /\bghr_[0-9a-zA-Z]{36,}/,                                label: 'GitHub refresh token' },
+  { pattern: /\bSECRET_KEY\s*=\s*['"][^'"]{8,}['"]/i,                 label: 'SECRET_KEY' },
+  { pattern: /\bPRIVATE_KEY\s*=\s*\S+/i,                              label: 'PRIVATE_KEY' },
+  { pattern: /\bDATABASE_URL\s*=\s*\S+/i,                             label: 'DATABASE_URL' },
+  { pattern: /\bAPI_KEY\s*=\s*['"][^'"]{8,}['"]/i,                     label: 'API_KEY' },
+  { pattern: /-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----/,               label: 'PEM private key' },
+  { pattern: /\b(password|passwd|pwd)\s*[:=]\s*['"][^'"]{4,}['"]/i,    label: 'hardcoded password' },
+];
+
+/**
+ * Source file extensions to scan for hardcoded credentials.
+ * Covers JavaScript, TypeScript, JSON config, YAML config, and shell scripts.
+ */
+const SCANNABLE_EXTENSIONS = new Set([
+  '.js', '.ts', '.mjs', '.cjs', '.jsx', '.tsx',
+  '.json', '.yaml', '.yml', '.toml',
+  '.sh', '.bash', '.cmd', '.bat', '.ps1'
+]);
+
+/**
+ * Scan the project for leaked secrets (OWASP A05 — Security Misconfiguration).
+ *
+ * Two-layer detection:
+ *   1. Dot-env files: Checks for the existence of .env, .env.local, .env.production,
+ *      etc. at the project root. If a .npmignore or "files" whitelist does NOT
+ *      exclude them, they could be published to npm and expose credentials.
+ *   2. Hardcoded credentials: Scans project-root source files for patterns like
+ *      NPM_TOKEN=..., AWS_SECRET_ACCESS_KEY=..., PEM private keys, GitHub tokens,
+ *      and hardcoded passwords.
+ *
+ * @param {{ message: string, category: string, fixable: boolean, fixDescription: string|null, fix: Function|null }[]} threats
+ * @param {object} [_testData] - Optional test injection.
+ * @param {string} [_testData.projectDir] - Project directory (defaults to cwd).
+ * @param {string[]} [_testData.existingFiles] - List of filenames present (overrides fs check).
+ * @param {object} [_testData.fileContents] - Map of filename → file contents (overrides fs read).
+ */
+function checkSecretsLeakage(threats, _testData) {
+  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : process.cwd();
+
+  // Determine which files are excluded from npm publish via "files" whitelist or .npmignore
+  let publishExcludes = null; // null means no whitelist — everything is included
+  try {
+    const pkgJson = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8'));
+    if (Array.isArray(pkgJson.files)) {
+      publishExcludes = new Set(pkgJson.files.map(f => f.toLowerCase()));
+    }
+  } catch {
+    // No package.json — skip publish exclusion check
+  }
+
+  // ── Layer 1: .env file detection ───────────────────────────────────────
+  for (const envFile of SECRET_FILE_PATTERNS) {
+    const exists = _testData && _testData.existingFiles
+      ? _testData.existingFiles.includes(envFile)
+      : fs.existsSync(path.join(projectDir, envFile));
+
+    if (exists) {
+      // Check if the file would be published
+      const wouldPublish = publishExcludes === null || publishExcludes.has(envFile.toLowerCase());
+      const riskLevel = wouldPublish ? 'may be published to npm' : 'exists in project root';
+
+      threats.push({
+        message: `SECRETS: ${envFile} found — ${riskLevel}. Add to .npmignore or .gitignore to prevent credential leakage (OWASP A05)`,
+        category: 'SECRETS',
+        fixable: false,
+        fixDescription: null,
+        fix: null
+      });
+    }
+  }
+
+  // ── Layer 2: Hardcoded credential patterns in source files ─────────────
+  let filesToScan = [];
+
+  if (_testData && _testData.fileContents) {
+    filesToScan = Object.keys(_testData.fileContents);
+  } else {
+    try {
+      const entries = fs.readdirSync(projectDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        if (entry.name === 'node_modules') continue;
+        const ext = path.extname(entry.name).toLowerCase();
+        if (SCANNABLE_EXTENSIONS.has(ext) || entry.name === '.npmrc') {
+          filesToScan.push(entry.name);
+        }
+      }
+    } catch {
+      return;
+    }
+  }
+
+  for (const fileName of filesToScan) {
+    let content;
+    if (_testData && _testData.fileContents && _testData.fileContents[fileName]) {
+      content = _testData.fileContents[fileName];
+    } else {
+      try {
+        content = fs.readFileSync(path.join(projectDir, fileName), 'utf8');
+      } catch {
+        continue;
+      }
+    }
+
+    // Limit scan to first 100KB per file to avoid performance issues on large bundles
+    const scanContent = content.length > 102400 ? content.substring(0, 102400) : content;
+
+    const foundSecrets = [];
+    for (const { pattern, label } of SECRET_VALUE_PATTERNS) {
+      if (pattern.test(scanContent)) {
+        foundSecrets.push(label);
+      }
+    }
+
+    if (foundSecrets.length > 0) {
+      threats.push({
+        message: `SECRETS: ${fileName} contains hardcoded credential(s): ${foundSecrets.join(', ')} — use environment variables instead (OWASP A05)`,
+        category: 'SECRETS',
+        fixable: false,
+        fixDescription: null,
+        fix: null
+      });
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  16. C2 Domain Blocklist Scan — SSRF Indicator Detection (OWASP A10)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Scan installed packages in node_modules/ for hardcoded URLs or IP addresses
+ * that resolve to known command-and-control (C2) domains.
+ *
+ * While SSRF is typically a runtime vulnerability, in a supply-chain context
+ * the risk manifests when a dependency contains hardcoded network calls to
+ * known malware infrastructure. The TeamPCP campaign, for example, embedded
+ * C2 callback URLs directly in compromised packages.
+ *
+ * Strategy:
+ *   1. Walk top-level directories under node_modules/ (and scoped @org/ dirs).
+ *   2. For each package, scan .js / .mjs / .cjs / .json files (first 100KB).
+ *   3. Extract all URL-like strings and raw IP addresses.
+ *   4. Compare extracted hostnames/IPs against the C2 blocklist from
+ *      getEffectiveIocs().c2Domains, plus a hardcoded suspicious-IP list.
+ *   5. Flag matches as SSRF category threats.
+ *
+ * @param {{ message: string, category: string, fixable: boolean, fixDescription: string|null, fix: Function|null }[]} threats
+ * @param {object} [_testData] - Optional test injection.
+ * @param {string} [_testData.nodeModulesDir] - Path to node_modules (defaults to cwd/node_modules).
+ * @param {Object<string, string>} [_testData.packageFiles] - Map of "pkgName/file" → content.
+ */
+
+/** File extensions to scan inside packages for network indicators. */
+const SSRF_SCANNABLE_EXTENSIONS = ['.js', '.mjs', '.cjs', '.json'];
+
+/** Maximum file size (bytes) to scan per file. */
+const SSRF_MAX_FILE_SIZE = 102400;
+
+/**
+ * Known suspicious IP addresses associated with malware campaigns.
+ * These are non-RFC1918, non-loopback addresses seen in TeamPCP and similar
+ * campaigns as fallback C2 beacons.
+ */
+const SUSPICIOUS_IPS = [
+  '45.61.136.85',        // TeamPCP staging server
+  '45.61.137.171',       // TeamPCP variant
+  '185.62.56.25',        // WAVESHAPER beacon
+  '193.233.20.2',        // Credential exfil relay
+  '194.26.135.89',       // PyPI dropper callback
+];
+
+/**
+ * Regex to extract URLs from source code. Matches http(s) and ws(s) schemes.
+ * Captures the full URL including path.
+ */
+const URL_EXTRACTION_REGEX = /(?:https?|wss?):\/\/([a-zA-Z0-9._-]+(?:\.[a-zA-Z]{2,}))(\/[^\s'"`,;)\]}>]*)?/g;
+
+/**
+ * Regex to extract raw IPv4 addresses from source code.
+ * Excludes common false positives like version strings (e.g., "1.2.3").
+ */
+const IPV4_EXTRACTION_REGEX = /\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/g;
+
+function checkSsrfIndicators(threats, _testData) {
+  const cwd = process.cwd();
+  const nodeModulesDir = (_testData && _testData.nodeModulesDir)
+    ? _testData.nodeModulesDir
+    : path.join(cwd, 'node_modules');
+
+  // Only scan when node_modules exists (unless test data provides packageFiles)
+  if (!_testData || !_testData.packageFiles) {
+    if (!fs.existsSync(nodeModulesDir)) return;
+  }
+
+  const blockedDomains = new Set(getEffectiveIocs().c2Domains.map(d => d.toLowerCase()));
+  const blockedIPs = new Set(SUSPICIOUS_IPS);
+
+  // ── Test-data path: scan synthetic file contents ───────────────────────
+  if (_testData && _testData.packageFiles) {
+    for (const [filePath, content] of Object.entries(_testData.packageFiles)) {
+      const pkgName = filePath.split('/')[0];
+      const scanContent = content.length > SSRF_MAX_FILE_SIZE
+        ? content.substring(0, SSRF_MAX_FILE_SIZE) : content;
+      scanContentForSsrf(scanContent, pkgName, filePath, blockedDomains, blockedIPs, threats);
+    }
+    return;
+  }
+
+  // ── Real path: walk node_modules ───────────────────────────────────────
+  let topLevelEntries;
+  try {
+    topLevelEntries = fs.readdirSync(nodeModulesDir, { withFileTypes: true });
+  } catch { return; }
+
+  const packageDirs = [];
+  for (const entry of topLevelEntries) {
+    if (!entry.isDirectory()) continue;
+    if (entry.name === '.package-lock.json' || entry.name === '.cache') continue;
+
+    if (entry.name.startsWith('@')) {
+      // Scoped packages: @org/pkg
+      try {
+        const scopedEntries = fs.readdirSync(path.join(nodeModulesDir, entry.name), { withFileTypes: true });
+        for (const scoped of scopedEntries) {
+          if (scoped.isDirectory()) {
+            packageDirs.push({ name: `${entry.name}/${scoped.name}`, dir: path.join(nodeModulesDir, entry.name, scoped.name) });
+          }
+        }
+      } catch { /* unreadable scope dir */ }
+    } else {
+      packageDirs.push({ name: entry.name, dir: path.join(nodeModulesDir, entry.name) });
+    }
+  }
+
+  for (const pkg of packageDirs) {
+    scanPackageDir(pkg.dir, pkg.name, blockedDomains, blockedIPs, threats);
+  }
+}
+
+/**
+ * Recursively scan a package directory for files with matching extensions,
+ * up to one level of nesting (to avoid scanning nested node_modules).
+ */
+function scanPackageDir(dir, pkgName, blockedDomains, blockedIPs, threats) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+
+  for (const entry of entries) {
+    if (entry.name === 'node_modules') continue;
+
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isFile()) {
+      const ext = path.extname(entry.name).toLowerCase();
+      if (!SSRF_SCANNABLE_EXTENSIONS.includes(ext)) continue;
+
+      try {
+        const stat = fs.statSync(fullPath);
+        if (stat.size > SSRF_MAX_FILE_SIZE) continue;
+        const content = fs.readFileSync(fullPath, 'utf8');
+        scanContentForSsrf(content, pkgName, `${pkgName}/${entry.name}`, blockedDomains, blockedIPs, threats);
+      } catch { /* unreadable file */ }
+    } else if (entry.isDirectory()) {
+      // One level deeper (e.g., lib/, dist/, src/)
+      scanPackageSubdir(fullPath, pkgName, blockedDomains, blockedIPs, threats);
+    }
+  }
+}
+
+/**
+ * Scan a single subdirectory within a package (one level only).
+ */
+function scanPackageSubdir(dir, pkgName, blockedDomains, blockedIPs, threats) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const ext = path.extname(entry.name).toLowerCase();
+    if (!SSRF_SCANNABLE_EXTENSIONS.includes(ext)) continue;
+
+    const fullPath = path.join(dir, entry.name);
+    try {
+      const stat = fs.statSync(fullPath);
+      if (stat.size > SSRF_MAX_FILE_SIZE) continue;
+      const content = fs.readFileSync(fullPath, 'utf8');
+      const relativePath = `${pkgName}/${path.basename(dir)}/${entry.name}`;
+      scanContentForSsrf(content, pkgName, relativePath, blockedDomains, blockedIPs, threats);
+    } catch { /* unreadable file */ }
+  }
+}
+
+/**
+ * Scan a string of source code for URLs / IPs matching blocklists.
+ * Deduplicates findings per package to avoid flooding the threat list.
+ */
+function scanContentForSsrf(content, pkgName, filePath, blockedDomains, blockedIPs, threats) {
+  const findings = [];
+
+  // ── URL extraction ────────────────────────────────────────────────────
+  let match;
+  URL_EXTRACTION_REGEX.lastIndex = 0;
+  while ((match = URL_EXTRACTION_REGEX.exec(content)) !== null) {
+    const hostname = match[1].toLowerCase();
+    if (blockedDomains.has(hostname)) {
+      findings.push(`C2 domain "${hostname}" in URL`);
+    }
+  }
+
+  // ── Raw IP extraction ─────────────────────────────────────────────────
+  IPV4_EXTRACTION_REGEX.lastIndex = 0;
+  while ((match = IPV4_EXTRACTION_REGEX.exec(content)) !== null) {
+    const ip = match[1];
+    // Skip version-like octets (0.x.x, x.0.0) and loopback / private ranges
+    if (/^0\./.test(ip) || ip === '127.0.0.1' || ip === '0.0.0.0') continue;
+    if (/^10\./.test(ip) || /^172\.(1[6-9]|2\d|3[01])\./.test(ip) || /^192\.168\./.test(ip)) continue;
+    if (blockedIPs.has(ip)) {
+      findings.push(`suspicious IP ${ip}`);
+    }
+  }
+
+  if (findings.length > 0) {
+    const deduped = [...new Set(findings)];
+    threats.push({
+      message: `SSRF: ${pkgName} contains ${deduped.length} network indicator(s) pointing to known malware infrastructure: ${deduped.join('; ')} — found in ${filePath} (OWASP A10)`,
+      category: 'SSRF',
+      fixable: true,
+      fixDescription: `npm uninstall ${pkgName} (remove the compromised package)`,
+      fix: () => execSync(`npm uninstall ${pkgName}`, { stdio: 'ignore', timeout: 30000 })
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  SBOM (Software Bill of Materials) — CycloneDX format
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2690,7 +3210,11 @@ const VEX_SEVERITY_MAP = {
   TEAMPCP: 'critical',
   OUTDATED: 'medium',
   REGISTRY: 'high',
-  LIFECYCLE_SCRIPT: 'high'
+  LIFECYCLE_SCRIPT: 'high',
+  NPM_DOCTOR: 'medium',
+  NO_LOCKFILE: 'high',
+  SECRETS: 'critical',
+  SSRF: 'critical'
 };
 
 /**
@@ -2770,7 +3294,7 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts };
+module.exports = { check, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  8. Provenance Verification — "Shadow Execution" Detection
