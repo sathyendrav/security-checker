@@ -1,5 +1,7 @@
 # @sathyendra/security-checker
 
+> **Stop supply-chain attacks before they execute.** One command. Zero dependencies. 18 security checks.
+
 [![npm version](https://img.shields.io/npm/v/@sathyendra/security-checker)](https://www.npmjs.com/package/@sathyendra/security-checker)
 [![npm downloads](https://img.shields.io/npm/dm/@sathyendra/security-checker)](https://www.npmjs.com/package/@sathyendra/security-checker)
 [![license](https://img.shields.io/github/license/sathyendrav/security-checker)](https://github.com/sathyendrav/security-checker/blob/main/LICENSE)
@@ -8,22 +10,72 @@
 [![GitHub issues](https://img.shields.io/github/issues/sathyendrav/security-checker)](https://github.com/sathyendrav/security-checker/issues)
 [![zero dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](https://github.com/sathyendrav/security-checker)
 
-A lightweight, zero-dependency security scanner for npm projects. Detects malicious packages, high/critical vulnerabilities, outdated dependencies (OWASP A06), dropper packages, decoy swap attacks, integrity mismatches, TeamPCP/WAVESHAPER artifacts, cross-ecosystem (PyPI) threats, provenance violations, and C2 domain indicators — before they can execute. Also generates CycloneDX SBOMs and VEX reports for enterprise supply-chain compliance.
+## The Problem
 
-## Why this exists
+Packages like `event-stream`, `ua-parser-js`, and `coa` were hijacked to run malicious `postinstall` scripts — stealing credentials, installing backdoors, and exfiltrating data. **By the time `npm install` finishes, the damage is already done.**
 
-Supply-chain attacks increasingly abuse npm `postinstall` scripts to drop malware. This package can be used as a `preinstall` hook in your project so it blocks threats **before** any dependency scripts run.
+Traditional tools (`npm audit`) only check for *known CVEs*. They miss:
 
-## Installation
+- Typosquatted / hijacked packages hiding in your lockfile
+- Dropper packages that download malware via `postinstall` scripts
+- Tampered `package.json` files swapped after install
+- C2 (command & control) domains hardcoded in dependencies
+- Stolen npm tokens used to publish without CI/CD provenance
 
-```bash
-npm install --save-dev @sathyendra/security-checker
-```
-
-Or use it as a one-off scan in any project:
+## The Solution
 
 ```bash
 npx @sathyendra/security-checker
+```
+
+**That's it.** One command scans your entire project for 18 categories of supply-chain threats — before any malicious code can execute.
+
+### Before vs After
+
+**Without `sec-check`** — you run `npm install` and hope for the best:
+
+```
+$ npm install
+added 847 packages in 12s
+  ← malicious postinstall already ran, credentials stolen
+```
+
+**With `sec-check`** — threats are caught and blocked:
+
+```
+$ npx @sathyendra/security-checker
+
+──────────────────────────────────────────────────────────────────────
+  @sathyendra/security-checker — Diagnostic Report
+──────────────────────────────────────────────────────────────────────
+  🚨 CRITICAL: plain-crypto-js detected in node_modules       [FIXABLE]
+  🚨 LOCKFILE: flatmap-stream found in dependency tree         [FIXABLE]
+  🚨 DROPPER: suspicious-pkg has postinstall with curl | sh   [MANUAL]
+  ⚠️  PROVENANCE: "axios@1.7.0" — Manual Publish Detected      [MANUAL]
+  ⚠️  OUTDATED: lodash@3.10.1 — 2 major versions behind        [MANUAL]
+──────────────────────────────────────────────────────────────────────
+  5 threat(s) found | 2 fixable | 3 require manual review
+  Run with --fix to auto-remediate fixable threats.
+──────────────────────────────────────────────────────────────────────
+```
+
+## Quick Start
+
+```bash
+# Scan any project (no install needed)
+npx @sathyendra/security-checker
+
+# Or install as a dev dependency
+npm install --save-dev @sathyendra/security-checker
+
+# Auto-fix what can be fixed
+sec-check --fix
+
+# Protect every future install (adds preinstall hook)
+sec-check --init
+
+# Full Zero Trust workflow: scan → safe install → verify
+sec-check --shield
 ```
 
 ## CLI Usage
