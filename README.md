@@ -2,6 +2,27 @@
 
 > **Stop supply-chain attacks before they execute.** One command. Zero dependencies. 18 security checks.
 
+## Table of Contents
+
+- [Why this exists](#the-problem)
+- [Quickstart](#quick-start)
+- [What it checks](#what-it-checks)
+- [CLI flags reference](#cli-usage)
+- [Exit codes](#cli-usage)
+- [CI/CD usage](#use-in-cicd)
+- [False positives & tuning](#false-positives--tuning)
+- [Permissions](#permissions)
+- [Preinstall strategy](#preinstall-strategy)
+- [Zero Trust Shield (`--shield`)](#zero-trust-shield---shield)
+- [OWASP risk mapping](#owasp-risk-mapping)
+- [Machine-readable JSON output](#machine-readable-json-output)
+- [CycloneDX VEX report](#cyclonedx-vex-report)
+- [CycloneDX SBOM generation](#cyclonedx-sbom-generation)
+- [Dynamic IOC updates](#dynamic-ioc-updates)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [License](#license)
+
 [![npm version](https://img.shields.io/npm/v/@sathyendra/security-checker)](https://www.npmjs.com/package/@sathyendra/security-checker)
 [![npm downloads](https://img.shields.io/npm/dm/@sathyendra/security-checker)](https://www.npmjs.com/package/@sathyendra/security-checker)
 [![license](https://img.shields.io/github/license/sathyendrav/security-checker)](https://github.com/sathyendrav/security-checker/blob/main/LICENSE)
@@ -671,6 +692,101 @@ Adding this package to your project's `preinstall` script ensures it runs before
   }
 }
 ```
+
+## False positives & tuning
+
+`sec-check` is intentionally strict. If a legitimate package is flagged, here's how to handle each case.
+
+### Allowlisting a dependency's lifecycle scripts
+
+If a package is flagged by the **Dependency Script Sandboxing** check (e.g. `husky`, `electron`, `node-gyp`) and you have manually verified it is safe:
+
+```bash
+sec-check --approve husky
+sec-check --approve electron
+```
+
+Approved packages are stored in `.sec-check-approved.json` at your project root. This file is safe to commit:
+
+```json
+{
+  "approved": ["husky", "electron"],
+  "approvedAt": {
+    "husky": "2026-01-15T12:00:00.000Z",
+    "electron": "2026-01-15T12:00:00.000Z"
+  }
+}
+```
+
+> Approval is intentionally scoped to a single project. A package approved in one repo is not automatically trusted in another.
+
+### Provenance false positives
+
+The **Provenance verification** check flags popular packages (axios, lodash, express, etc.) that lack a CI/CD provenance attestation. Most older versions pre-date npm provenance. To silence this for a specific package:
+
+```bash
+sec-check --approve axios
+```
+
+Or, if your project uses private packages that are intentionally published without provenance, approve them as above.
+
+### RAT artifact check not running (non-admin)
+
+If you see:
+
+```
+⚠️  Running without admin/root — RAT artifact scans may miss indicators
+```
+
+This is expected on developer machines. The scan still runs all other checks. To also run RAT scans:
+
+- **Windows**: open the terminal as Administrator
+- **macOS / Linux**: prefix with `sudo`
+
+In CI, most runners execute as root / with admin — the warning will not appear.
+
+### Outdated dependency noise
+
+The **Outdated dependencies** check flags packages that are one or more major versions behind the latest release. If your project intentionally pins an older major (e.g. React 17 while v19 is out), you can:
+
+1. Accept the warning — it does **not** cause a hard fail (it is `[MANUAL]`, not `[CRITICAL]`)
+2. Approve the package to silence it:
+
+```bash
+sec-check --approve react
+```
+
+### npm audit false positives
+
+If `npm audit` reports vulnerabilities that have been assessed as not exploitable in your context, use npm's built-in audit suppression:
+
+```bash
+npm audit --audit-level=critical   # raise the threshold
+```
+
+`sec-check` respects the `high` threshold by default. Vulnerabilities below `high` severity are not surfaced.
+
+### Environment / proxy warnings
+
+If your network routes traffic through a corporate proxy (`http_proxy` / `https_proxy`), the **Environment check** may flag it as a MITM risk. To suppress this, ensure your proxy variable points to localhost or a verified internal host:
+
+```bash
+# Verified internal proxy — not flagged
+https_proxy=http://proxy.corp.example.com:8080
+
+# Unknown external proxy — flagged
+https_proxy=http://1.2.3.4:3128
+```
+
+There is no suppress flag for proxy warnings — review the proxy host before deploying.
+
+### Custom / private npm registry
+
+If your project uses a private registry (Verdaccio, Artifactory, GitHub Packages), the **Registry Guard** check will flag it as a potential Dependency Confusion risk and the **HTTP registry** check will flag any `http://` URL.
+
+For HTTPS private registries, no action is needed beyond acknowledging the `[MANUAL]` warning — a private HTTPS registry is not blocked. For HTTP internal registries, migrate to HTTPS. There is no bypass for `REGISTRY_HTTP` findings.
+
+---
 
 ## License
 
