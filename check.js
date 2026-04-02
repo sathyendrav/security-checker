@@ -6,7 +6,9 @@ const { execSync } = require('child_process');
 const os = require('os');
 
 /**
- * Main security scan. Returns true if any threats are found.
+ * Main security scan entry point.
+ * Runs all detection modules sequentially and collects threats.
+ * @returns {Promise<boolean>} true if one or more threats were detected, false if clean.
  */
 async function check() {
   const threats = [];
@@ -18,13 +20,18 @@ async function check() {
     console.warn('⚠️  Running without admin/root — RAT artifact scans may miss indicators');
   }
 
-  // 1. Known malicious package: plain-crypto-js
+  // 1. Known malicious package detection
+  //    plain-crypto-js is a supply-chain attack package that mimics crypto-js.
+  //    If present in node_modules, the project is compromised.
   const malDir = path.join(process.cwd(), 'node_modules', 'plain-crypto-js');
   if (fs.existsSync(malDir)) {
     threats.push('CRITICAL: plain-crypto-js detected in node_modules');
   }
 
-  // 2. npm audit — flag high and critical severity vulnerabilities
+  // 2. npm audit — flag high and critical severity vulnerabilities.
+  //    We run `npm audit --json` and parse the structured output.
+  //    Only high and critical severities are flagged; low/moderate are ignored
+  //    to reduce noise and avoid blocking installs unnecessarily.
   try {
     const auditOutput = execSync('npm audit --json', {
       timeout: 30000,
@@ -39,7 +46,9 @@ async function check() {
       threats.push(`SECURITY: ${vulns} high/critical vulnerabilities found (run npm audit for details)`);
     }
   } catch (err) {
-    // npm audit exits with non-zero when vulnerabilities exist; parse what we can
+    // npm audit exits with a non-zero code when vulnerabilities are present,
+    // so a "failed" execution is actually normal when issues exist.
+    // We capture stdout from the error object and parse it for vulnerability counts.
     if (err.stdout) {
       try {
         const data = JSON.parse(err.stdout);
@@ -55,12 +64,15 @@ async function check() {
     }
   }
 
-  // 3. RAT artifact detection (requires admin/root)
+  // 3. RAT (Remote Access Trojan) artifact detection.
+  //    Checks well-known file drop locations used by trojans.
+  //    Skipped without admin/root since those paths are typically protected.
   if (hasAdmin) {
     checkRATArtifacts(sys, threats);
   }
 
-  // 4. C2 domain indicator in hosts file
+  // 4. C2 (Command & Control) domain indicator in the system hosts file.
+  //    Attackers sometimes modify the hosts file to redirect traffic to C2 servers.
   checkHostsFile(threats);
 
   // Report results
@@ -74,8 +86,11 @@ async function check() {
 }
 
 /**
- * Check for admin (Windows) or root (Unix) privileges.
- * Returns a Promise<boolean>.
+ * Check whether the current process has elevated privileges.
+ * - Windows: attempts `net session`, which only succeeds with admin rights.
+ * - Unix/macOS: checks if the effective UID is 0 (root).
+ * @param {string} sys - The OS platform string from os.platform().
+ * @returns {Promise<boolean>} true if running with elevated privileges.
  */
 function checkPermissions(sys) {
   return new Promise(resolve => {
@@ -94,8 +109,14 @@ function checkPermissions(sys) {
 }
 
 /**
- * Check well-known RAT drop locations per OS.
- * Only called when we have sufficient permissions.
+ * Check well-known RAT (Remote Access Trojan) drop locations per OS.
+ * These paths are commonly used by malware families to stage payloads:
+ *   - Windows: wt.exe in ProgramData (masquerades as Windows Terminal)
+ *   - macOS:   com.apple.act.mond in Library/Caches (mimics a system daemon)
+ *   - Linux:   ld.py in /tmp (a common staging directory for initial payloads)
+ * Only called when the process has admin/root privileges.
+ * @param {string} sys - The OS platform string.
+ * @param {string[]} threats - Array to push threat descriptions into.
  */
 function checkRATArtifacts(sys, threats) {
   const ratPaths = {
@@ -119,9 +140,12 @@ function checkRATArtifacts(sys, threats) {
 }
 
 /**
- * Scan the hosts file for known C2 domain indicators.
- * Only checks Unix-style path; Windows hosts file check is a no-op
- * (Windows users can extend this as needed).
+ * Scan the system hosts file for known C2 (Command & Control) domain indicators.
+ * Malware may add entries to the hosts file to redirect DNS lookups to attacker-controlled
+ * servers. Currently checks for "sfrclak.com", a known C2 domain.
+ * Supports both Windows and Unix hosts file paths.
+ * Fails silently if the file is unreadable (e.g., permissions).
+ * @param {string[]} threats - Array to push threat descriptions into.
  */
 function checkHostsFile(threats) {
   const hostsPath = os.platform() === 'win32'

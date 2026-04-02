@@ -4,12 +4,12 @@ A lightweight, zero-dependency security scanner for npm projects. Detects malici
 
 ## Why this exists
 
-Supply-chain attacks increasingly abuse npm `postinstall` scripts to drop malware. This package runs as a `preinstall` hook so it blocks threats **before** any dependency scripts run.
+Supply-chain attacks increasingly abuse npm `postinstall` scripts to drop malware. This package can be used as a `preinstall` hook in your project so it blocks threats **before** any dependency scripts run.
 
 ## Installation
 
 ```bash
-npm install @sathyendra/security-checker
+npm install --save-dev @sathyendra/security-checker
 ```
 
 Or use it as a one-off scan in any project:
