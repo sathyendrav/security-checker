@@ -24,6 +24,24 @@ const DEFAULT_IOC_URL =
   'https://raw.githubusercontent.com/sathyendrav/axios-security-checker/main/ioc-db.json';
 
 /**
+ * Ed25519 public key for verifying IOC database signatures.
+ *
+ * The IOC database is signed by the package maintainer using the corresponding
+ * private key (stored offline, never committed). This prevents a compromised
+ * GitHub account from pushing a malicious ioc-db.json that whitelists attacker
+ * domains — the signature check will fail without the private key.
+ *
+ * Signature file convention: <ioc-url>.sig (e.g., ioc-db.json.sig)
+ * Format: raw Ed25519 signature, base64-encoded, single line.
+ *
+ * Users who set a custom SEC_CHECK_IOC_URL can bypass signature verification
+ * by also setting SEC_CHECK_IOC_SKIP_VERIFY=1 (they trust their own source).
+ */
+const IOC_SIGNING_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAsnjcIEFf47loa7NYKRNlN221rtV2CZm9cOpoHmwqtKQ=
+-----END PUBLIC KEY-----`;
+
+/**
  * Path to the local IOC database cache file.
  * Stored in the user's home directory under .sec-check/ so it persists
  * across projects and npm installs.
@@ -65,6 +83,9 @@ function loadIocDb() {
  *   - Each field (c2Domains, etc.) must be an array of strings
  *   - Individual entries are validated (domains must look like domains,
  *     package names must be non-empty lowercase strings)
+ *   - Ed25519 signature verification (fetches <url>.sig and verifies against
+ *     the hardcoded public key). Skipped when using a custom URL with
+ *     SEC_CHECK_IOC_SKIP_VERIFY=1.
  *
  * @param {string} [url] - URL to fetch from. Defaults to DEFAULT_IOC_URL.
  * @returns {Promise<{ ok: boolean, message: string, added?: { domains: number, npm: number, pypi: number } }>}
@@ -77,71 +98,126 @@ function updateDb(url) {
     return Promise.resolve({ ok: false, message: 'Refused: only HTTPS URLs are accepted for IOC updates' });
   }
 
-  return new Promise(resolve => {
-    const req = https.get(iocUrl, { timeout: 15000 }, (res) => {
+  // Determine whether signature verification should be performed.
+  // Custom URLs can opt out by setting SEC_CHECK_IOC_SKIP_VERIFY=1.
+  const isDefaultUrl = (iocUrl === DEFAULT_IOC_URL);
+  const skipVerify = !isDefaultUrl && process.env.SEC_CHECK_IOC_SKIP_VERIFY === '1';
+
+  return new Promise(async resolve => {
+    try {
+      // 1. Fetch the IOC JSON body
+      const body = await fetchHttps(iocUrl, 512 * 1024);
+
+      // 2. Signature verification (unless explicitly skipped for custom URLs)
+      if (!skipVerify) {
+        const sigUrl = iocUrl + '.sig';
+        let sigBody;
+        try {
+          sigBody = await fetchHttps(sigUrl, 1024);
+        } catch (sigErr) {
+          resolve({ ok: false, message: `Signature fetch failed (${sigUrl}): ${sigErr.message}` });
+          return;
+        }
+
+        const sigValid = verifyIocSignature(body, sigBody.trim());
+        if (!sigValid) {
+          resolve({ ok: false, message: 'Signature verification failed — IOC data may have been tampered with' });
+          return;
+        }
+      }
+
+      // 3. Parse and validate
+      const data = JSON.parse(body);
+      const validated = validateIocData(data);
+      if (!validated.ok) {
+        resolve(validated);
+        return;
+      }
+
+      // 4. Write to disk
+      const dbPath = getDbPath();
+      const dbDir = path.dirname(dbPath);
+      if (!fs.existsSync(dbDir)) {
+        fs.mkdirSync(dbDir, { recursive: true });
+      }
+
+      const toSave = {
+        c2Domains: data.c2Domains || [],
+        maliciousNpmPackages: data.maliciousNpmPackages || [],
+        maliciousPypiPackages: data.maliciousPypiPackages || [],
+        updatedAt: new Date().toISOString(),
+        sourceUrl: iocUrl
+      };
+
+      fs.writeFileSync(dbPath, JSON.stringify(toSave, null, 2));
+
+      // Count new entries (not already in hardcoded lists)
+      const newDomains = (toSave.c2Domains).filter(d => !C2_DOMAINS.includes(d)).length;
+      const newNpm = (toSave.maliciousNpmPackages).filter(p => !MALICIOUS_PACKAGES.includes(p)).length;
+      const newPypi = (toSave.maliciousPypiPackages).filter(p => !MALICIOUS_PYPI_PACKAGES.includes(p)).length;
+
+      resolve({
+        ok: true,
+        message: `IOC database updated (${dbPath})${skipVerify ? ' [signature verification skipped]' : ' [signature verified ✓]'}`,
+        added: { domains: newDomains, npm: newNpm, pypi: newPypi }
+      });
+    } catch (err) {
+      resolve({ ok: false, message: err.message || 'Unknown error during IOC update' });
+    }
+  });
+}
+
+/**
+ * Fetch a URL over HTTPS and return the response body as a string.
+ *
+ * @param {string} url - HTTPS URL to fetch.
+ * @param {number} maxBytes - Maximum response size in bytes.
+ * @returns {Promise<string>} The response body.
+ * @throws {Error} On HTTP errors, size limit, timeout, or network failures.
+ */
+function fetchHttps(url, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { timeout: 15000 }, (res) => {
       if (res.statusCode !== 200) {
         res.resume();
-        resolve({ ok: false, message: `HTTP ${res.statusCode} from IOC source` });
+        reject(new Error(`HTTP ${res.statusCode} from ${url}`));
         return;
       }
 
       let body = '';
-      const maxBytes = 512 * 1024; // 512 KB limit
       res.setEncoding('utf8');
 
       res.on('data', chunk => {
         body += chunk;
         if (body.length > maxBytes) {
           req.destroy();
-          resolve({ ok: false, message: 'Response exceeded 512 KB limit — aborting' });
+          reject(new Error(`Response exceeded ${Math.round(maxBytes / 1024)} KB limit`));
         }
       });
 
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          const validated = validateIocData(data);
-          if (!validated.ok) {
-            resolve(validated);
-            return;
-          }
-
-          // Write to disk
-          const dbPath = getDbPath();
-          const dbDir = path.dirname(dbPath);
-          if (!fs.existsSync(dbDir)) {
-            fs.mkdirSync(dbDir, { recursive: true });
-          }
-
-          const toSave = {
-            c2Domains: data.c2Domains || [],
-            maliciousNpmPackages: data.maliciousNpmPackages || [],
-            maliciousPypiPackages: data.maliciousPypiPackages || [],
-            updatedAt: new Date().toISOString(),
-            sourceUrl: iocUrl
-          };
-
-          fs.writeFileSync(dbPath, JSON.stringify(toSave, null, 2));
-
-          // Count new entries (not already in hardcoded lists)
-          const newDomains = (toSave.c2Domains).filter(d => !C2_DOMAINS.includes(d)).length;
-          const newNpm = (toSave.maliciousNpmPackages).filter(p => !MALICIOUS_PACKAGES.includes(p)).length;
-          const newPypi = (toSave.maliciousPypiPackages).filter(p => !MALICIOUS_PYPI_PACKAGES.includes(p)).length;
-
-          resolve({
-            ok: true,
-            message: `IOC database updated (${dbPath})`,
-            added: { domains: newDomains, npm: newNpm, pypi: newPypi }
-          });
-        } catch {
-          resolve({ ok: false, message: 'Invalid JSON in IOC response' });
-        }
-      });
+      res.on('end', () => resolve(body));
     });
 
-    req.on('error', (err) => resolve({ ok: false, message: `Network error: ${err.message}` }));
-    req.on('timeout', () => { req.destroy(); resolve({ ok: false, message: 'Request timed out (15s)' }); });
+    req.on('error', (err) => reject(new Error(`Network error: ${err.message}`)));
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out (15s)')); });
   });
+}
+
+/**
+ * Verify the Ed25519 signature of IOC data.
+ *
+ * @param {string} data - The raw IOC JSON string (exactly as fetched).
+ * @param {string} signatureBase64 - Base64-encoded Ed25519 signature.
+ * @returns {boolean} true if the signature is valid.
+ */
+function verifyIocSignature(data, signatureBase64) {
+  try {
+    const publicKey = crypto.createPublicKey(IOC_SIGNING_PUBLIC_KEY);
+    const signature = Buffer.from(signatureBase64, 'base64');
+    return crypto.verify(null, Buffer.from(data), publicKey, signature);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -367,6 +443,19 @@ async function check(options = {}) {
   //    they were published from a CI/CD pipeline linked to a GitHub repository.
   //    A manual publish of a popular package is a strong indicator of token theft.
   await provenanceAudit(threats);
+
+  // 9. Process-level shadow execution detection.
+  //    Checks for library preload hijacking (LD_PRELOAD, DYLD_INSERT_LIBRARIES),
+  //    NODE_OPTIONS --require injection, and suspicious parent processes (netcat,
+  //    mshta, wscript, and other LOLBins). These indicate the Node.js process
+  //    was spawned or hijacked by a reverse shell or stager chain.
+  checkShadowExecution(sys, threats);
+
+  // 10. Outdated dependency detection (A06 — Vulnerable and Outdated Components).
+  //     Runs `npm outdated --json` and flags packages where the installed version
+  //     is a major version behind the latest release. Major version drift often
+  //     means the package no longer receives security patches.
+  checkOutdatedDeps(threats);
 
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
@@ -1811,6 +1900,134 @@ function detectPythonStagers(cwd, threats) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  9. Process-Level Shadow Execution Detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Known suspicious parent process names.
+ *
+ * Attackers may spawn Node.js from a dropper binary, a reverse shell,
+ * or a scripting engine used as a stager. Legitimate parent processes
+ * (bash, cmd.exe, node, npm, etc.) are NOT listed here.
+ *
+ * Each entry is lowercase for case-insensitive comparison.
+ */
+const SUSPICIOUS_PARENT_NAMES = [
+  'nc',             // netcat — classic reverse shell
+  'ncat',           // nmap's netcat
+  'socat',          // bidirectional relay (reverse shell)
+  'mshta',          // Windows LOLBin — runs HTA payloads
+  'wscript',        // Windows Script Host — runs VBS/JS stagers
+  'cscript',        // Windows Script Host (console)
+  'regsvr32',       // Windows LOLBin — can download and exec DLLs
+  'rundll32',       // Windows LOLBin — runs DLL exports
+  'certutil',       // Windows LOLBin — used for download/decode
+  'bitsadmin',      // Windows LOLBin — background transfer
+  'msiexec',        // Windows LOLBin — remote MSI execution
+];
+
+/**
+ * Detect process-level execution hijacking.
+ *
+ * Two categories of checks:
+ *
+ *   1. Library preload hijacking (Linux / macOS):
+ *      - LD_PRELOAD (Linux): Forces a shared library to be loaded before all others,
+ *        allowing function interception (e.g., hooking crypto, network, or file I/O).
+ *      - DYLD_INSERT_LIBRARIES (macOS): Same technique for Darwin systems.
+ *      - NODE_OPTIONS with --require: Injects a module before the app starts.
+ *      These are legitimate for debugging but extremely suspicious in production
+ *      or CI/CD pipelines.
+ *
+ *   2. Suspicious parent process detection:
+ *      Node.js being spawned by netcat, mshta, wscript, or other known LOLBins
+ *      (Living Off the Land Binaries) indicates a reverse shell or stager chain.
+ *      We read /proc/<ppid>/comm on Linux, use `ps` on macOS, and
+ *      `wmic process` on Windows.
+ *
+ * @param {string} sys - The OS platform string from os.platform().
+ * @param {object[]} threats - Array to push structured threat objects into.
+ */
+function checkShadowExecution(sys, threats) {
+  // ── 1. Library preload / module injection environment variables ─────────
+  const preloadVars = {
+    LD_PRELOAD: process.env.LD_PRELOAD,
+    DYLD_INSERT_LIBRARIES: process.env.DYLD_INSERT_LIBRARIES,
+  };
+
+  for (const [varName, value] of Object.entries(preloadVars)) {
+    if (value && value.trim().length > 0) {
+      threats.push({
+        message: `SHADOW EXEC: ${varName} is set ("${value.length > 80 ? value.slice(0, 80) + '…' : value}") — ` +
+          'library preload can intercept crypto, network, or file I/O calls',
+        category: 'SHADOW_EXEC',
+        fixable: false,
+        fixDescription: null,
+        fix: null
+      });
+    }
+  }
+
+  // Check NODE_OPTIONS for --require injection (preloads a module before the app)
+  const nodeOpts = process.env.NODE_OPTIONS || '';
+  if (/--require\s/.test(nodeOpts) || /-r\s/.test(nodeOpts)) {
+    threats.push({
+      message: `SHADOW EXEC: NODE_OPTIONS contains --require ("${nodeOpts.length > 80 ? nodeOpts.slice(0, 80) + '…' : nodeOpts}") — ` +
+        'a module is injected before application startup',
+      category: 'SHADOW_EXEC',
+      fixable: false,
+      fixDescription: null,
+      fix: null
+    });
+  }
+
+  // ── 2. Suspicious parent process detection ─────────────────────────────
+  try {
+    let parentName = '';
+    const ppid = process.ppid;
+
+    if (sys === 'win32') {
+      // Use wmic to get parent process name by PID
+      const out = execSync(
+        `wmic process where ProcessId=${Number(ppid)} get Name /format:list`,
+        { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }
+      );
+      const match = out.match(/Name=(.+)/i);
+      if (match) parentName = match[1].trim().replace(/\.exe$/i, '');
+    } else if (sys === 'linux') {
+      // /proc/<ppid>/comm contains the short process name (max 15 chars)
+      const commPath = `/proc/${ppid}/comm`;
+      if (fs.existsSync(commPath)) {
+        parentName = fs.readFileSync(commPath, 'utf8').trim();
+      }
+    } else if (sys === 'darwin') {
+      parentName = execSync(
+        `ps -p ${Number(ppid)} -o comm=`,
+        { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }
+      ).trim();
+      // ps on macOS returns the full path — extract just the binary name
+      parentName = path.basename(parentName);
+    }
+
+    if (parentName) {
+      const lower = parentName.toLowerCase();
+      if (SUSPICIOUS_PARENT_NAMES.includes(lower)) {
+        threats.push({
+          message: `SHADOW EXEC: Node.js spawned by suspicious parent process "${parentName}" (PID ${ppid}) — ` +
+            'possible reverse shell or LOLBin stager chain',
+          category: 'SHADOW_EXEC',
+          fixable: false,
+          fixDescription: null,
+          fix: null
+        });
+      }
+    }
+  } catch {
+    // Parent process lookup failed — non-fatal, skip silently
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Diagnostic Report & Auto-Remediation
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1908,7 +2125,293 @@ async function runFixes(threats) {
   console.log(`${divider}\n`);
 }
 
-module.exports = { check, updateDb, getDbPath, loadIocDb, getEffectiveIocs };
+// ─────────────────────────────────────────────────────────────────────────────
+//  10. Outdated Dependency Detection (OWASP A06)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Run `npm outdated --json` and flag packages where the installed version
+ * is a major version behind the latest release.
+ *
+ * A package that is one or more major versions behind is unlikely to receive
+ * security patches, violating OWASP A06 (Vulnerable and Outdated Components).
+ * Minor/patch drift is ignored to avoid excessive noise.
+ *
+ * @param {{ message: string, category: string, fixable: boolean, fixDescription: string|null, fix: Function|null }[]} threats
+ * @param {object} [_testData] - Optional pre-parsed npm-outdated data (for testing only).
+ */
+function checkOutdatedDeps(threats, _testData) {
+  let data = _testData;
+
+  if (!data) {
+    let outdatedJson;
+    try {
+      outdatedJson = execSync('npm outdated --json', {
+        timeout: 30000,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
+      });
+    } catch (err) {
+      // npm outdated exits with code 1 when outdated packages exist — this is normal.
+      outdatedJson = err.stdout || '';
+    }
+
+    if (!outdatedJson.trim()) return;
+
+    try {
+      data = JSON.parse(outdatedJson);
+    } catch {
+      return; // Unparseable — skip silently
+    }
+  }
+
+  for (const [name, info] of Object.entries(data)) {
+    const current = info.current;
+    const latest = info.latest;
+    if (!current || !latest) continue;
+
+    const currentMajor = parseMajor(current);
+    const latestMajor = parseMajor(latest);
+    if (currentMajor === null || latestMajor === null) continue;
+
+    if (latestMajor > currentMajor) {
+      threats.push({
+        message: `OUTDATED: ${name}@${current} is ${latestMajor - currentMajor} major version(s) behind (latest: ${latest})`,
+        category: 'OUTDATED',
+        fixable: false,
+        fixDescription: null,
+        fix: null
+      });
+    }
+  }
+}
+
+/**
+ * Parse the major version number from a semver string.
+ * Returns null for unparseable versions.
+ *
+ * @param {string} version - A semver version string (e.g., "3.2.1").
+ * @returns {number|null}
+ */
+function parseMajor(version) {
+  const match = /^(\d+)\./.exec(version);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SBOM (Software Bill of Materials) — CycloneDX format
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Generate a CycloneDX SBOM (spec 1.6) from the project's package-lock.json.
+ *
+ * Produces a machine-readable inventory of every dependency (direct and
+ * transitive) in the project. Each component includes name, version, purl
+ * (Package URL), and scope. The SBOM can be fed into OWASP Dependency-Track,
+ * Grype, or any CycloneDX-compatible tool for continuous supply-chain
+ * monitoring.
+ *
+ * @returns {object} CycloneDX SBOM document object, or an object with an error property.
+ */
+function generateSbom() {
+  const cwd = process.cwd();
+  const serialNumber = `urn:uuid:${crypto.randomUUID()}`;
+
+  // Read root package.json for project metadata
+  let rootPkg = {};
+  try {
+    rootPkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8'));
+  } catch {
+    return { error: 'No package.json found in current directory' };
+  }
+
+  const projectName = rootPkg.name || path.basename(cwd);
+  const projectVersion = rootPkg.version || '0.0.0';
+
+  // Read package-lock.json for the full dependency tree
+  let lockData;
+  try {
+    lockData = JSON.parse(fs.readFileSync(path.join(cwd, 'package-lock.json'), 'utf8'));
+  } catch {
+    return { error: 'No package-lock.json found — run npm install first' };
+  }
+
+  // Determine direct dependencies for scope classification
+  const directDeps = new Set();
+  if (rootPkg.dependencies) {
+    for (const name of Object.keys(rootPkg.dependencies)) directDeps.add(name);
+  }
+  const directDevDeps = new Set();
+  if (rootPkg.devDependencies) {
+    for (const name of Object.keys(rootPkg.devDependencies)) directDevDeps.add(name);
+  }
+
+  // Extract all packages from the lockfile
+  const packages = extractPackagesFromLockfile(lockData);
+
+  const components = packages.map((pkg) => {
+    const scope = directDeps.has(pkg.name)
+      ? 'required'
+      : directDevDeps.has(pkg.name)
+        ? 'optional'
+        : 'required'; // transitive deps of production deps default to required
+
+    const component = {
+      type: 'library',
+      name: pkg.name,
+      version: pkg.version || 'unknown',
+      scope,
+      purl: `pkg:npm/${pkg.name.startsWith('@') ? pkg.name.replace('/', '%2F') : pkg.name}@${pkg.version || 'unknown'}`,
+      'bom-ref': `${pkg.name}@${pkg.version || 'unknown'}`
+    };
+
+    if (pkg.integrity) {
+      // Parse the integrity hash (e.g., "sha512-abc123...")
+      const match = /^(sha\d+)-(.+)$/.exec(pkg.integrity);
+      if (match) {
+        component.hashes = [
+          {
+            alg: match[1].toUpperCase().replace('SHA', 'SHA-'),
+            content: Buffer.from(match[2], 'base64').toString('hex')
+          }
+        ];
+      }
+    }
+
+    return component;
+  });
+
+  return {
+    bomFormat: 'CycloneDX',
+    specVersion: '1.6',
+    version: 1,
+    serialNumber,
+    metadata: {
+      timestamp: new Date().toISOString(),
+      tools: {
+        components: [
+          {
+            type: 'application',
+            name: '@sathyendra/security-checker',
+            version: require('./package.json').version
+          }
+        ]
+      },
+      component: {
+        type: 'application',
+        name: projectName,
+        version: projectVersion,
+        'bom-ref': `${projectName}@${projectVersion}`
+      }
+    },
+    components
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  VEX (Vulnerability Exploitability eXchange) — CycloneDX format
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Map internal threat categories to CycloneDX severity rating values.
+ * Categories not listed here default to 'unknown'.
+ * @type {Object<string, string>}
+ */
+const VEX_SEVERITY_MAP = {
+  CRITICAL: 'critical',
+  SECURITY: 'high',
+  DROPPER: 'critical',
+  INTEGRITY: 'high',
+  SWAP: 'medium',
+  MTIME: 'low',
+  PYPI: 'high',
+  PROVENANCE: 'high',
+  SHADOW_EXEC: 'critical',
+  PTH_MALWARE: 'critical',
+  LOCKFILE: 'high',
+  C2: 'critical',
+  TEAMPCP: 'critical',
+  OUTDATED: 'medium'
+};
+
+/**
+ * Format a JSON scan result into a CycloneDX VEX document (spec 1.6).
+ *
+ * Produces a standards-compliant CycloneDX BOM with vulnerability entries
+ * that include exploitability analysis, severity ratings, and remediation
+ * recommendations. The output can be consumed by any CycloneDX-compatible
+ * toolchain (e.g., OWASP Dependency-Track, Grype, Trivy).
+ *
+ * Each threat is assigned a deterministic ID based on a SHA-256 hash of its
+ * message, so the same finding always produces the same vulnerability ID
+ * across runs.
+ *
+ * @param {object} jsonResult - The structured result from check({ json: true }).
+ * @returns {object} CycloneDX VEX document object.
+ */
+function formatAsVex(jsonResult) {
+  const serialNumber = `urn:uuid:${crypto.randomUUID()}`;
+  const projectRef = jsonResult.metadata.project || 'unknown-project';
+
+  return {
+    bomFormat: 'CycloneDX',
+    specVersion: '1.6',
+    version: 1,
+    serialNumber,
+    metadata: {
+      timestamp: jsonResult.metadata.timestamp,
+      tools: {
+        components: [
+          {
+            type: 'application',
+            name: jsonResult.metadata.tool,
+            version: jsonResult.metadata.version
+          }
+        ]
+      },
+      component: {
+        type: 'application',
+        name: projectRef,
+        'bom-ref': projectRef
+      }
+    },
+    vulnerabilities: jsonResult.threats.map((t) => {
+      const hash = crypto.createHash('sha256').update(t.message).digest('hex').substring(0, 8);
+      const id = `SEC-CHECK-${(t.category || 'UNKNOWN').toUpperCase()}-${hash}`;
+      const severity = VEX_SEVERITY_MAP[t.category] || 'unknown';
+
+      return {
+        id,
+        source: {
+          name: '@sathyendra/security-checker',
+          url: 'https://github.com/sathyendrav/axios-security-checker'
+        },
+        ratings: [
+          {
+            severity,
+            method: 'other',
+            source: {
+              name: '@sathyendra/security-checker'
+            }
+          }
+        ],
+        description: t.message,
+        recommendation: t.fixDescription || 'Manual review required',
+        analysis: {
+          state: 'exploitable',
+          response: [t.fixable ? 'update' : 'can_not_fix']
+        },
+        affects: [
+          {
+            ref: projectRef
+          }
+        ]
+      };
+    })
+  };
+}
+
+module.exports = { check, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  8. Provenance Verification — "Shadow Execution" Detection

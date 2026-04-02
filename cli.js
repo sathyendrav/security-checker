@@ -2,7 +2,7 @@
 'use strict';
 
 // Import the main security scanning logic and IOC database utilities
-const { check, updateDb, getDbPath, loadIocDb } = require('./check.js');
+const { check, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -11,6 +11,8 @@ const { check, updateDb, getDbPath, loadIocDb } = require('./check.js');
  *   sec-check               Run a read-only scan and print the Diagnostic Report.
  *   sec-check --fix         Print the report, then auto-remediate fixable threats.
  *   sec-check --json        Output machine-readable JSON (for dashboards / VEX reports).
+ *   sec-check --vex-out     Output results as a CycloneDX VEX document (spec 1.6).
+ *   sec-check --sbom        Generate a CycloneDX SBOM (Software Bill of Materials).
  *   sec-check --update-db   Fetch the latest IOC database from a trusted source.
  *   sec-check --help        Show usage information.
  *
@@ -31,6 +33,12 @@ Options:
   --json        Output results as machine-readable JSON instead of the human-readable
                 Diagnostic Report. Suitable for CI/CD pipelines, security dashboards,
                 and VEX (Vulnerability Exploitability eXchange) report generation.
+  --vex-out     Output a CycloneDX VEX document (spec 1.6) instead of the human-readable
+                Diagnostic Report. Directly consumable by OWASP Dependency-Track, Grype,
+                and other CycloneDX-compatible tools.
+  --sbom        Generate a CycloneDX SBOM (Software Bill of Materials) listing every
+                dependency in the project with name, version, purl, scope, and integrity
+                hashes. Does not run a security scan.
   --update-db   Fetch the latest IOC (Indicators of Compromise) database from a
                 trusted remote source. The fetched data is cached locally at
                 ${getDbPath()}
@@ -65,16 +73,33 @@ Exit codes:
     }
   }
 
+  // Handle --sbom: generate CycloneDX SBOM and exit (no security scan)
+  if (args.includes('--sbom')) {
+    const sbom = generateSbom();
+    if (sbom.error) {
+      console.error(`❌ SBOM generation failed: ${sbom.error}`);
+      process.exit(1);
+    }
+    console.log(JSON.stringify(sbom, null, 2));
+    process.exit(0);
+  }
+
   const fix = args.includes('--fix');
   const jsonMode = args.includes('--json');
+  const vexOut = args.includes('--vex-out');
 
   try {
-    // Run security checks; returns true/false when json=false, structured object when json=true.
-    // In default mode the Diagnostic Report is printed first; in JSON mode it is suppressed.
+    // --vex-out implies JSON mode internally (needs the structured result object).
+    // In default mode the Diagnostic Report is printed first; in JSON/VEX mode it is suppressed.
     // When --fix is passed, fixable threats are auto-remediated after the report.
-    const result = await check({ fix, json: jsonMode });
+    const result = await check({ fix, json: jsonMode || vexOut });
 
-    if (jsonMode) {
+    if (vexOut) {
+      // CycloneDX VEX document — directly consumable by Dependency-Track, Grype, etc.
+      const vexDoc = formatAsVex(result);
+      console.log(JSON.stringify(vexDoc, null, 2));
+      process.exit(result.summary.clean ? 0 : 1);
+    } else if (jsonMode) {
       // Machine-readable output to stdout — suitable for piping to dashboards / VEX generators
       console.log(JSON.stringify(result, null, 2));
       process.exit(result.summary.clean ? 0 : 1);

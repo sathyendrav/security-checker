@@ -1,6 +1,6 @@
 # @sathyendra/security-checker
 
-A lightweight, zero-dependency security scanner for npm projects. Detects malicious packages, high/critical vulnerabilities, dropper packages, decoy swap attacks, integrity mismatches, TeamPCP/WAVESHAPER artifacts, cross-ecosystem (PyPI) threats, provenance violations, and C2 domain indicators — before they can execute.
+A lightweight, zero-dependency security scanner for npm projects. Detects malicious packages, high/critical vulnerabilities, outdated dependencies (OWASP A06), dropper packages, decoy swap attacks, integrity mismatches, TeamPCP/WAVESHAPER artifacts, cross-ecosystem (PyPI) threats, provenance violations, and C2 domain indicators — before they can execute. Also generates CycloneDX SBOMs and VEX reports for enterprise supply-chain compliance.
 
 ## Why this exists
 
@@ -24,6 +24,8 @@ npx @sathyendra/security-checker
 sec-check               # Read-only scan — prints Diagnostic Report only
 sec-check --fix         # Print report, then auto-remediate fixable threats
 sec-check --json        # Output machine-readable JSON (for dashboards / VEX reports)
+sec-check --vex-out     # Output CycloneDX VEX document (spec 1.6)
+sec-check --sbom        # Generate CycloneDX SBOM (dependency inventory)
 sec-check --update-db   # Fetch latest IOC database from trusted source
 sec-check --help        # Show usage information
 ```
@@ -62,7 +64,7 @@ The tool **never modifies** your project unless you explicitly pass `--fix`. Eve
 
 \* Package names are validated against npm naming rules before being passed to shell commands. If a lockfile contains a suspiciously crafted name (possible command injection), the threat is downgraded to `[MANUAL]`.
 
-Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifacts, C2 hosts entries, PyPI packages, Python stagers, provenance issues.
+Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifacts, C2 hosts entries, PyPI packages, Python stagers, provenance issues, shadow execution indicators, outdated dependencies.
 
 ## What it checks
 
@@ -79,7 +81,11 @@ Threats that **cannot** be auto-fixed (always `[MANUAL]`): TeamPCP system artifa
 | Cross-ecosystem (PyPI) | Scans `requirements.txt`, `Pipfile`, and `Pipfile.lock` for known malicious PyPI packages from the same TeamPCP campaign (LiteLLM, Telnyx, Trivy, KICS variants) |
 | Python stager detection | Flags suspicious `.py` files in Node.js project roots that contain backdoor-like patterns (subprocess, socket, exec, base64) |
 | Malicious .pth files | Scans Python `site-packages` (system + local venvs) for `.pth` files with executable `import` lines containing base64, subprocess, exec/eval, or network calls — the "importless" execution technique used by TeamPCP. Only triggered when a Python dependency file (requirements.txt, Pipfile, etc.) is present |
-| Provenance verification | Checks high-profile packages (axios, lodash, express, etc.) for npm provenance attestations. Flags “Suspicious: Manual Publish Detected” when a popular package is published without a CI/CD pipeline link or GitHub repository — a sign of stolen npm token usage |## Machine-Readable JSON Output
+| Provenance verification | Checks high-profile packages (axios, lodash, express, etc.) for npm provenance attestations. Flags "Suspicious: Manual Publish Detected" when a popular package is published without a CI/CD pipeline link or GitHub repository — a sign of stolen npm token usage |
+| Shadow execution detection | Detects process-level execution hijacking: `LD_PRELOAD` (Linux), `DYLD_INSERT_LIBRARIES` (macOS), `NODE_OPTIONS --require` injection, and suspicious parent processes (netcat, mshta, wscript, and other LOLBins that indicate a reverse shell or stager chain) |
+| Outdated dependencies | Flags packages where the installed version is one or more major versions behind the latest release (OWASP A06). Major version drift often means the package no longer receives security patches |
+
+## Machine-Readable JSON Output
 
 Use `--json` to output structured results suitable for security dashboards, CI/CD artifact collection, and VEX (Vulnerability Exploitability eXchange) report generation:
 
@@ -125,6 +131,100 @@ sec-check --json > scan-results.json
 sec-check --json | jq '.threats[] | select(.category == "CRITICAL")'
 ```
 
+## CycloneDX VEX Report
+
+Use `--vex-out` to output a standards-compliant [CycloneDX VEX](https://cyclonedx.org/capabilities/vex/) document (spec 1.6). This makes your scan results directly consumable by enterprise tools like OWASP Dependency-Track, Grype, and Trivy — no post-processing required.
+
+```bash
+sec-check --vex-out
+sec-check --vex-out > vex-report.json
+```
+
+Example output (truncated):
+
+```json
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "serialNumber": "urn:uuid:a1b2c3d4-...",
+  "metadata": {
+    "timestamp": "2026-04-02T12:00:00.000Z",
+    "tools": {
+      "components": [
+        {
+          "type": "application",
+          "name": "@sathyendra/security-checker",
+          "version": "1.12.0"
+        }
+      ]
+    },
+    "component": {
+      "type": "application",
+      "name": "my-app",
+      "bom-ref": "my-app"
+    }
+  },
+  "vulnerabilities": [
+    {
+      "id": "SEC-CHECK-CRITICAL-3f2a1b4c",
+      "source": {
+        "name": "@sathyendra/security-checker",
+        "url": "https://github.com/sathyendrav/axios-security-checker"
+      },
+      "ratings": [{ "severity": "critical", "method": "other" }],
+      "description": "CRITICAL: plain-crypto-js detected in node_modules",
+      "recommendation": "npm uninstall plain-crypto-js",
+      "analysis": {
+        "state": "exploitable",
+        "response": ["update"]
+      },
+      "affects": [{ "ref": "my-app" }]
+    }
+  ]
+}
+```
+
+Each vulnerability receives a **deterministic ID** (`SEC-CHECK-<CATEGORY>-<hash>`) based on the threat message, so the same finding always produces the same ID across runs. The `analysis.response` field maps to `"update"` for fixable threats and `"can_not_fix"` for manual-only threats.
+
+Feed VEX output into your SBOM pipeline:
+
+```bash
+# Ingest into OWASP Dependency-Track
+sec-check --vex-out | curl -X POST https://dtrack.example.com/api/v1/vex \
+  -H 'Content-Type: application/json' -H "X-Api-Key: $DTRACK_KEY" -d @-
+
+# Combine with --fix for remediate-then-report workflows
+sec-check --fix --vex-out > vex-report.json
+```
+
+## CycloneDX SBOM Generation
+
+Use `--sbom` to generate a [CycloneDX](https://cyclonedx.org/) Software Bill of Materials (SBOM) listing every dependency in your project. This gives you a machine-readable inventory of your supply chain — a key requirement for OWASP A06 compliance and executive orders like EO 14028.
+
+```bash
+sec-check --sbom
+sec-check --sbom > sbom.json
+```
+
+The SBOM is generated from `package-lock.json` and includes:
+
+- **Every dependency** (direct and transitive) with name, version, and scope
+- **Package URLs (purl)** in the standard `pkg:npm/` format for cross-tool interoperability
+- **Integrity hashes** extracted from the lockfile (SHA-512 → hex-encoded)
+- **Tool metadata** identifying `@sathyendra/security-checker` as the generator
+
+The `--sbom` flag does **not** run a security scan — it only produces the component inventory. Combine with `--vex-out` in your pipeline for a complete picture:
+
+```bash
+# Generate SBOM + VEX in one pipeline
+sec-check --sbom > sbom.json && sec-check --vex-out > vex.json
+
+# Feed both into OWASP Dependency-Track
+curl -F "bom=@sbom.json" https://dtrack.example.com/api/v1/bom
+curl -F "vex=@vex.json" https://dtrack.example.com/api/v1/vex
+```
+
 ## Dynamic IOC Updates
 
 TeamPCP is known for rapidly rotating C2 domains and typosquatting new package names. Instead of waiting for a full npm release, you can fetch the latest Indicators of Compromise (IOCs) on demand:
@@ -138,6 +238,7 @@ This fetches a JSON IOC list from a trusted HTTPS source (the [`ioc-db.json`](ht
 **Security constraints:**
 - Only HTTPS URLs are accepted (no HTTP, `file://`, or `data:`)
 - Response size is capped at 512 KB
+- **Ed25519 signature verification** — the fetched `ioc-db.json` must have a matching `.sig` file signed by the maintainer's private key. The public key is hardcoded in the scanner. This prevents a compromised GitHub account from pushing a malicious IOC database that whitelists attacker domains.
 - Domain and package name entries are validated before caching
 - Invalid individual entries are silently filtered (don't reject the whole update)
 
@@ -145,6 +246,12 @@ This fetches a JSON IOC list from a trusted HTTPS source (the [`ioc-db.json`](ht
 
 ```bash
 SEC_CHECK_IOC_URL=https://example.com/my-iocs.json sec-check --update-db
+```
+
+When using a custom IOC URL, signature verification is enforced by default (the `.sig` file must exist at `<url>.sig`). If you trust your own source and don't want to sign, set `SEC_CHECK_IOC_SKIP_VERIFY=1`:
+
+```bash
+SEC_CHECK_IOC_URL=https://internal.corp/iocs.json SEC_CHECK_IOC_SKIP_VERIFY=1 sec-check --update-db
 ```
 
 The expected JSON format:
