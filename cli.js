@@ -2,7 +2,7 @@
 'use strict';
 
 // Import the main security scanning logic and IOC database utilities
-const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom } = require('./check.js');
+const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -14,6 +14,9 @@ const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb
  *   sec-check --vex-out     Output results as a CycloneDX VEX document (spec 1.6).
  *   sec-check --sbom        Generate a CycloneDX SBOM (Software Bill of Materials).
  *   sec-check --update-db   Fetch the latest IOC database from a trusted source.
+ *   sec-check --add-ioc     Add one project-local IOC entry to .sec-check-ioc.json.
+ *   sec-check --submit-ioc  Generate a prefilled GitHub issue URL for global IOC submission.
+ *   sec-check --submit-ioc-batch Generate submission URL(s) from all local IOC entries.
  *   sec-check --pre         Preinstall mode: lockfile + environment scan (no node_modules needed).
  *   sec-check --init        Auto-configure package.json with preinstall & secure-install scripts.
  *   sec-check --shield     Run the Zero Trust Shield: pre-flight → isolated install → post-vetting.
@@ -69,6 +72,22 @@ Options:
                 ${getDbPath()}
                 and merged with the built-in lists on every scan.
                 Override the source URL with SEC_CHECK_IOC_URL env variable.
+  --add-ioc <type> <value>
+                Add a project-local IOC to .sec-check-ioc.json.
+                <type> must be one of: c2, npm, pypi
+                Examples:
+                  sec-check --add-ioc c2 bad-domain.example
+                  sec-check --add-ioc npm typosquat-package
+                  sec-check --add-ioc pypi fake-litellm
+  --submit-ioc <type> <value>
+                Generate a prefilled GitHub issue URL for submitting the IOC
+                to the upstream global database (ioc-db.json) for all users.
+                <type> must be one of: c2, npm, pypi
+  --submit-ioc-batch
+                Generate a prefilled GitHub issue URL using ALL entries in
+                .sec-check-ioc.json.
+                Add --split to generate one URL per IOC entry instead of one
+                combined issue.
   --help        Show this help message.
 
 Exit codes:
@@ -112,6 +131,80 @@ Exit codes:
     } else {
       console.error(`❌ ${result.message}`);
       process.exit(1);
+    }
+    process.exit(0);
+  }
+
+  // Handle --add-ioc <type> <value>: add project-local IOC entry
+  if (args.includes('--add-ioc')) {
+    const idx = args.indexOf('--add-ioc');
+    const iocType = args[idx + 1];
+    const iocValue = args[idx + 2];
+    if (!iocType || !iocValue || iocType.startsWith('--') || iocValue.startsWith('--')) {
+      console.error('❌ Usage: sec-check --add-ioc <c2|npm|pypi> <value>');
+      process.exit(1);
+    }
+
+    const result = addProjectIoc(iocType, iocValue);
+    if (!result.ok) {
+      console.error(`❌ ${result.message}`);
+      process.exit(1);
+    }
+
+    console.log(`✅ ${result.message}`);
+    console.log(`   File: ${result.file}`);
+    console.log('   This IOC will be merged with built-in + cached IOC lists for this project.');
+    process.exit(0);
+  }
+
+  // Handle --submit-ioc <type> <value>: generate global submission link
+  if (args.includes('--submit-ioc')) {
+    const idx = args.indexOf('--submit-ioc');
+    const iocType = args[idx + 1];
+    const iocValue = args[idx + 2];
+    if (!iocType || !iocValue || iocType.startsWith('--') || iocValue.startsWith('--')) {
+      console.error('❌ Usage: sec-check --submit-ioc <c2|npm|pypi> <value>');
+      process.exit(1);
+    }
+
+    const result = buildIocSubmission(iocType, iocValue);
+    if (!result.ok) {
+      console.error(`❌ ${result.message}`);
+      process.exit(1);
+    }
+
+    console.log('✅ IOC global submission template generated.');
+    console.log(`Title: ${result.title}`);
+    console.log('\nBody:\n');
+    console.log(result.body);
+    console.log('\nOpen this URL to submit:');
+    console.log(result.url);
+    process.exit(0);
+  }
+
+  // Handle --submit-ioc-batch: generate submission URL(s) from local IOC file
+  if (args.includes('--submit-ioc-batch')) {
+    const splitMode = args.includes('--split');
+    const result = buildIocBatchSubmission({ mode: splitMode ? 'split' : 'combined' });
+    if (!result.ok) {
+      console.error(`❌ ${result.message}`);
+      process.exit(1);
+    }
+
+    console.log(`✅ ${result.message}`);
+    if (result.mode === 'combined') {
+      if (result.title) {
+        console.log(`Title: ${result.title}`);
+      }
+      if (result.body) {
+        console.log('\nBody:\n');
+        console.log(result.body);
+      }
+    }
+
+    console.log('\nOpen URL(s) to submit:');
+    for (const u of result.urls || []) {
+      console.log(u);
     }
     process.exit(0);
   }

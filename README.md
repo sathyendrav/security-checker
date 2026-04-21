@@ -114,6 +114,10 @@ sec-check --json        # Output machine-readable JSON (for dashboards / VEX rep
 sec-check --vex-out     # Output CycloneDX VEX document (spec 1.6)
 sec-check --sbom        # Generate CycloneDX SBOM (dependency inventory)
 sec-check --update-db   # Fetch latest IOC database from trusted source
+sec-check --add-ioc <type> <value>    # Add project-local IOC (type: c2|npm|pypi)
+sec-check --submit-ioc <type> <value> # Generate prefilled GitHub issue for global IOC submission
+sec-check --submit-ioc-batch          # Generate submission URL from all local IOC entries
+sec-check --submit-ioc-batch --split  # Generate one submission URL per local IOC entry
 sec-check --help        # Show usage information
 ```
 
@@ -574,6 +578,59 @@ sec-check --update-db
 ```
 
 This fetches a JSON IOC list from a trusted HTTPS source (the [`ioc-db.json`](https://github.com/sathyendrav/security-checker/blob/main/ioc-db.json) file in the maintainer's GitHub repository by default) and caches it locally at `~/.sec-check/ioc-db.json`. On every scan, the cached IOCs are **merged** with the hardcoded baseline — the built-in lists are never replaced or reduced, only extended.
+
+### Project-Local IOC Extensions
+
+Need to block a domain/package immediately for one repo without waiting for a global release? Add it locally:
+
+```bash
+sec-check --add-ioc c2 suspicious-c2.example
+sec-check --add-ioc npm malicious-typosquat
+sec-check --add-ioc pypi fake-internal-sdk
+```
+
+This writes project-local indicators to `.sec-check-ioc.json` in your repo root:
+
+```json
+{
+  "c2Domains": ["suspicious-c2.example"],
+  "maliciousNpmPackages": ["malicious-typosquat"],
+  "maliciousPypiPackages": ["fake-internal-sdk"]
+}
+```
+
+During scans, project-local indicators are merged with:
+
+1. Hardcoded built-in IOC baseline
+2. Cached remote IOC DB (`~/.sec-check/ioc-db.json`, from `--update-db`)
+
+This means your local additions take effect immediately for your project while preserving upstream coverage.
+
+### Submit Local IOC for Global Usage
+
+If you want your indicator included for all users in upstream `ioc-db.json`, generate a prefilled GitHub issue:
+
+```bash
+sec-check --submit-ioc c2 suspicious-c2.example
+sec-check --submit-ioc npm malicious-typosquat
+sec-check --submit-ioc pypi fake-internal-sdk
+```
+
+The command prints a ready-to-open `issues/new` URL with title/body template so you can attach evidence and submit quickly.
+
+### Submit All Local IOCs at Once
+
+If your `.sec-check-ioc.json` has multiple entries, generate submission URL(s) in one command:
+
+```bash
+# One combined issue containing all local IOC entries
+sec-check --submit-ioc-batch
+
+# One issue per IOC entry
+sec-check --submit-ioc-batch --split
+```
+
+This reads all entries from `.sec-check-ioc.json` and prepares ready-to-open GitHub issue URLs.
 
 **Security constraints:**
 

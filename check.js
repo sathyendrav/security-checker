@@ -24,6 +24,19 @@ const DEFAULT_IOC_URL =
   'https://raw.githubusercontent.com/sathyendrav/security-checker/main/ioc-db.json';
 
 /**
+ * GitHub repository used for submitting new IOC suggestions.
+ */
+const IOC_SUBMISSION_REPO = 'https://github.com/sathyendrav/security-checker';
+
+/**
+ * Project-local IOC override file.
+ *
+ * This allows teams to enforce additional indicators for their own project
+ * without waiting for a global IOC database update.
+ */
+const PROJECT_IOC_FILE = '.sec-check-ioc.json';
+
+/**
  * Ed25519 public key for verifying IOC database signatures.
  *
  * The IOC database is signed by the package maintainer using the corresponding
@@ -71,6 +84,280 @@ function loadIocDb() {
   } catch {
     return null;
   }
+}
+
+/**
+ * Load project-local IOC overrides from .sec-check-ioc.json.
+ *
+ * @param {string} [projectDir] - Project directory (defaults to cwd).
+ * @returns {{ c2Domains: string[], maliciousNpmPackages: string[], maliciousPypiPackages: string[] }}
+ */
+function loadProjectIocs(projectDir) {
+  const dir = projectDir || process.cwd();
+  const filePath = path.join(dir, PROJECT_IOC_FILE);
+
+  try {
+    if (!fs.existsSync(filePath)) {
+      return { c2Domains: [], maliciousNpmPackages: [], maliciousPypiPackages: [] };
+    }
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    const sanitized = {
+      c2Domains: Array.isArray(data.c2Domains) ? data.c2Domains.filter(v => typeof v === 'string') : [],
+      maliciousNpmPackages: Array.isArray(data.maliciousNpmPackages) ? data.maliciousNpmPackages.filter(v => typeof v === 'string') : [],
+      maliciousPypiPackages: Array.isArray(data.maliciousPypiPackages) ? data.maliciousPypiPackages.filter(v => typeof v === 'string') : []
+    };
+
+    const validation = validateIocData(sanitized);
+    if (!validation.ok) {
+      return { c2Domains: [], maliciousNpmPackages: [], maliciousPypiPackages: [] };
+    }
+
+    return {
+      c2Domains: sanitized.c2Domains || [],
+      maliciousNpmPackages: sanitized.maliciousNpmPackages || [],
+      maliciousPypiPackages: sanitized.maliciousPypiPackages || []
+    };
+  } catch {
+    return { c2Domains: [], maliciousNpmPackages: [], maliciousPypiPackages: [] };
+  }
+}
+
+/**
+ * Add one IOC entry to the project-local IOC file.
+ *
+ * Usage categories:
+ *   - c2  -> c2Domains
+ *   - npm -> maliciousNpmPackages
+ *   - pypi -> maliciousPypiPackages
+ *
+ * @param {'c2'|'npm'|'pypi'} type - IOC type.
+ * @param {string} value - IOC value.
+ * @param {object} [_testData] - Optional test injection.
+ * @param {string} [_testData.projectDir] - Override project directory.
+ * @returns {{ ok: boolean, message: string, file?: string, key?: string, value?: string }}
+ */
+function addProjectIoc(type, value, _testData) {
+  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : process.cwd();
+  const filePath = path.join(projectDir, PROJECT_IOC_FILE);
+  const normalizedType = String(type || '').toLowerCase();
+  const normalizedValue = String(value || '').trim().toLowerCase();
+
+  if (!normalizedValue) {
+    return { ok: false, message: 'IOC value is required.' };
+  }
+
+  const keyMap = {
+    c2: 'c2Domains',
+    npm: 'maliciousNpmPackages',
+    pypi: 'maliciousPypiPackages'
+  };
+  const targetKey = keyMap[normalizedType];
+  if (!targetKey) {
+    return { ok: false, message: 'IOC type must be one of: c2, npm, pypi.' };
+  }
+
+  // Per-type validation
+  if (targetKey === 'c2Domains') {
+    const domainPattern = /^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$/i;
+    if (!domainPattern.test(normalizedValue)) {
+      return { ok: false, message: `Invalid C2 domain: "${normalizedValue}"` };
+    }
+  } else {
+    if (!isSafePackageName(normalizedValue)) {
+      return { ok: false, message: `Invalid package name: "${normalizedValue}"` };
+    }
+  }
+
+  let data = { c2Domains: [], maliciousNpmPackages: [], maliciousPypiPackages: [] };
+  try {
+    if (fs.existsSync(filePath)) {
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      data.c2Domains = Array.isArray(parsed.c2Domains) ? parsed.c2Domains : [];
+      data.maliciousNpmPackages = Array.isArray(parsed.maliciousNpmPackages) ? parsed.maliciousNpmPackages : [];
+      data.maliciousPypiPackages = Array.isArray(parsed.maliciousPypiPackages) ? parsed.maliciousPypiPackages : [];
+    }
+  } catch {
+    // Reset corrupted file in a safe, deterministic format.
+    data = { c2Domains: [], maliciousNpmPackages: [], maliciousPypiPackages: [] };
+  }
+
+  const current = new Set(data[targetKey].map(v => String(v).toLowerCase()));
+  if (current.has(normalizedValue)) {
+    return {
+      ok: true,
+      message: `"${normalizedValue}" already exists in ${PROJECT_IOC_FILE}.`,
+      file: filePath,
+      key: targetKey,
+      value: normalizedValue
+    };
+  }
+
+  data[targetKey].push(normalizedValue);
+
+  const validation = validateIocData({
+    c2Domains: data.c2Domains,
+    maliciousNpmPackages: data.maliciousNpmPackages,
+    maliciousPypiPackages: data.maliciousPypiPackages
+  });
+  if (!validation.ok) {
+    return { ok: false, message: `Invalid IOC data: ${validation.message}` };
+  }
+
+  const toWrite = {
+    c2Domains: [...new Set(data.c2Domains.map(v => String(v).toLowerCase()))],
+    maliciousNpmPackages: [...new Set(data.maliciousNpmPackages.map(v => String(v).toLowerCase()))],
+    maliciousPypiPackages: [...new Set(data.maliciousPypiPackages.map(v => String(v).toLowerCase()))]
+  };
+
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(toWrite, null, 2) + '\n', 'utf8');
+  } catch (err) {
+    return { ok: false, message: `Cannot write ${PROJECT_IOC_FILE}: ${err.message}` };
+  }
+
+  return {
+    ok: true,
+    message: `Added ${normalizedType} IOC "${normalizedValue}" to ${PROJECT_IOC_FILE}`,
+    file: filePath,
+    key: targetKey,
+    value: normalizedValue
+  };
+}
+
+/**
+ * Build a prefilled GitHub issue URL for submitting a new IOC globally.
+ *
+ * @param {'c2'|'npm'|'pypi'} type - IOC type.
+ * @param {string} value - IOC value.
+ * @returns {{ ok: boolean, message: string, url?: string, title?: string, body?: string }}
+ */
+function buildIocSubmission(type, value) {
+  const normalizedType = String(type || '').toLowerCase();
+  const normalizedValue = String(value || '').trim().toLowerCase();
+
+  if (!normalizedValue) {
+    return { ok: false, message: 'IOC value is required.' };
+  }
+
+  const labels = {
+    c2: 'c2Domains',
+    npm: 'maliciousNpmPackages',
+    pypi: 'maliciousPypiPackages'
+  };
+  const field = labels[normalizedType];
+  if (!field) {
+    return { ok: false, message: 'IOC type must be one of: c2, npm, pypi.' };
+  }
+
+  const title = `[IOC Submission] ${field}: ${normalizedValue}`;
+  const body = [
+    '### IOC Submission',
+    '',
+    `- Type: \`${field}\``,
+    `- Value: \`${normalizedValue}\``,
+    '',
+    '### Context / Evidence',
+    '- Source URL(s):',
+    '- Related advisory/CVE:',
+    '- Why this should be added globally:'
+  ].join('\n');
+
+  const url = `${IOC_SUBMISSION_REPO}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+  return { ok: true, message: 'Submission URL generated.', url, title, body };
+}
+
+/**
+ * Build IOC submission URL(s) from project-local IOC file.
+ *
+ * Modes:
+ *   - combined (default): one issue containing all project IOC entries
+ *   - split: one issue per IOC entry
+ *
+ * @param {object} [_options]
+ * @param {'combined'|'split'} [_options.mode='combined'] - Submission mode.
+ * @param {string} [_options.projectDir] - Override project directory.
+ * @returns {{ ok: boolean, message: string, count?: number, urls?: string[], title?: string, body?: string, mode?: string }}
+ */
+function buildIocBatchSubmission(_options) {
+  const options = _options || {};
+  const mode = (options.mode === 'split') ? 'split' : 'combined';
+  const projectIocs = loadProjectIocs(options.projectDir);
+
+  const entries = [];
+  for (const d of projectIocs.c2Domains || []) {
+    entries.push({ type: 'c2', field: 'c2Domains', value: d });
+  }
+  for (const p of projectIocs.maliciousNpmPackages || []) {
+    entries.push({ type: 'npm', field: 'maliciousNpmPackages', value: p });
+  }
+  for (const p of projectIocs.maliciousPypiPackages || []) {
+    entries.push({ type: 'pypi', field: 'maliciousPypiPackages', value: p });
+  }
+
+  if (entries.length === 0) {
+    return {
+      ok: false,
+      message: `No IOC entries found in ${PROJECT_IOC_FILE}. Add entries first with --add-ioc.`
+    };
+  }
+
+  if (mode === 'split') {
+    const urls = [];
+    for (const entry of entries) {
+      const one = buildIocSubmission(entry.type, entry.value);
+      if (one.ok && one.url) {
+        urls.push(one.url);
+      }
+    }
+    return {
+      ok: true,
+      message: `Generated ${urls.length} IOC submission URL(s) from ${PROJECT_IOC_FILE}.`,
+      mode,
+      count: urls.length,
+      urls
+    };
+  }
+
+  const title = `[IOC Submission] Batch update from ${PROJECT_IOC_FILE} (${entries.length} entries)`;
+  const grouped = {
+    c2Domains: entries.filter(e => e.field === 'c2Domains').map(e => e.value),
+    maliciousNpmPackages: entries.filter(e => e.field === 'maliciousNpmPackages').map(e => e.value),
+    maliciousPypiPackages: entries.filter(e => e.field === 'maliciousPypiPackages').map(e => e.value)
+  };
+
+  const body = [
+    '### IOC Batch Submission',
+    '',
+    `Source file: \`${PROJECT_IOC_FILE}\``,
+    `Total entries: ${entries.length}`,
+    '',
+    '### Proposed additions',
+    '',
+    `- c2Domains (${grouped.c2Domains.length}):`,
+    ...(grouped.c2Domains.length > 0 ? grouped.c2Domains.map(v => `  - \`${v}\``) : ['  - (none)']),
+    '',
+    `- maliciousNpmPackages (${grouped.maliciousNpmPackages.length}):`,
+    ...(grouped.maliciousNpmPackages.length > 0 ? grouped.maliciousNpmPackages.map(v => `  - \`${v}\``) : ['  - (none)']),
+    '',
+    `- maliciousPypiPackages (${grouped.maliciousPypiPackages.length}):`,
+    ...(grouped.maliciousPypiPackages.length > 0 ? grouped.maliciousPypiPackages.map(v => `  - \`${v}\``) : ['  - (none)']),
+    '',
+    '### Context / Evidence',
+    '- Source URL(s):',
+    '- Related advisory/CVE:',
+    '- Why these should be added globally:'
+  ].join('\n');
+
+  const url = `${IOC_SUBMISSION_REPO}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+  return {
+    ok: true,
+    message: `Generated 1 combined IOC submission URL from ${PROJECT_IOC_FILE}.`,
+    mode,
+    count: entries.length,
+    title,
+    body,
+    urls: [url]
+  };
 }
 
 /**
@@ -283,19 +570,20 @@ function validateIocData(data) {
  */
 function getEffectiveIocs() {
   const db = loadIocDb();
+  const projectIocs = loadProjectIocs();
   if (!db) {
     return {
-      c2Domains: [...C2_DOMAINS],
-      maliciousNpmPackages: [...MALICIOUS_PACKAGES],
-      maliciousPypiPackages: [...MALICIOUS_PYPI_PACKAGES]
+      c2Domains: [...new Set([...C2_DOMAINS, ...(projectIocs.c2Domains || [])])],
+      maliciousNpmPackages: [...new Set([...MALICIOUS_PACKAGES, ...(projectIocs.maliciousNpmPackages || [])])],
+      maliciousPypiPackages: [...new Set([...MALICIOUS_PYPI_PACKAGES, ...(projectIocs.maliciousPypiPackages || [])])]
     };
   }
 
   // Merge: hardcoded + remote, deduplicated
   const merged = {
-    c2Domains: [...new Set([...C2_DOMAINS, ...(db.c2Domains || [])])],
-    maliciousNpmPackages: [...new Set([...MALICIOUS_PACKAGES, ...(db.maliciousNpmPackages || [])])],
-    maliciousPypiPackages: [...new Set([...MALICIOUS_PYPI_PACKAGES, ...(db.maliciousPypiPackages || [])])]
+    c2Domains: [...new Set([...C2_DOMAINS, ...(db.c2Domains || []), ...(projectIocs.c2Domains || [])])],
+    maliciousNpmPackages: [...new Set([...MALICIOUS_PACKAGES, ...(db.maliciousNpmPackages || []), ...(projectIocs.maliciousNpmPackages || [])])],
+    maliciousPypiPackages: [...new Set([...MALICIOUS_PYPI_PACKAGES, ...(db.maliciousPypiPackages || []), ...(projectIocs.maliciousPypiPackages || [])])]
   };
 
   return merged;
@@ -3991,7 +4279,7 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel };
+module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow
