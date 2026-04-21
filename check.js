@@ -795,8 +795,9 @@ function deepLockfileAudit(threats) {
   const lockfilePath = path.join(process.cwd(), 'package-lock.json');
 
   if (!fs.existsSync(lockfilePath)) {
-    // No lockfile found — nothing to audit (yarn.lock handled separately below)
+    // No npm lockfile found — check yarn.lock and pnpm-lock.yaml instead.
     deepYarnLockAudit(threats);
+    deepPnpmLockAudit(threats);
     return;
   }
 
@@ -1166,6 +1167,169 @@ function deepYarnLockAudit(threats) {
       });
     }
   }
+}
+
+/**
+ * pnpm-lock.yaml audit — scans for known malicious package names.
+ *
+ * pnpm lockfiles are YAML-based and include package snapshots under the
+ * top-level `packages:` section. We parse package keys from that section and
+ * compare names against the effective malicious npm package IOC list.
+ *
+ * Also attempts dropper detection for entries that indicate install-time
+ * execution (`hasInstallScript: true` or `requiresBuild: true`) when
+ * node_modules exists.
+ *
+ * @param {object[]} threats - Array to push structured threat objects into ({message, category, fixable, fixDescription, fix}).
+ */
+function deepPnpmLockAudit(threats) {
+  const pnpmLockPath = path.join(process.cwd(), 'pnpm-lock.yaml');
+  if (!fs.existsSync(pnpmLockPath)) return;
+
+  let content;
+  try {
+    content = fs.readFileSync(pnpmLockPath, 'utf8');
+  } catch {
+    return;
+  }
+
+  const packages = extractPackagesFromPnpmLock(content);
+  if (packages.length === 0) return;
+
+  const effectiveNpmPkgs = new Set(getEffectiveIocs().maliciousNpmPackages);
+  for (const pkg of packages) {
+    if (effectiveNpmPkgs.has(pkg.name)) {
+      threats.push({
+        message: `LOCKFILE: known malicious package "${pkg.name}" found in pnpm-lock.yaml`,
+        category: 'LOCKFILE',
+        fixable: true,
+        fixDescription: `pnpm remove ${pkg.name}`,
+        fix: () => execSync(`pnpm remove ${pkg.name}`, { stdio: 'ignore', timeout: 30000 })
+      });
+    }
+  }
+
+  // Dropper heuristics are only possible when installed package files exist.
+  const nodeModulesDir = path.join(process.cwd(), 'node_modules');
+  if (!fs.existsSync(nodeModulesDir)) return;
+
+  for (const pkg of packages) {
+    if (!pkg.hasInstallScript) continue;
+    const suspicion = isLikelyDropper(nodeModulesDir, pkg.name);
+    if (!suspicion) continue;
+
+    const safeToFix = isSafePackageName(pkg.name);
+    threats.push({
+      message: `DROPPER: "${pkg.name}" has install scripts but ${suspicion}`,
+      category: 'DROPPER',
+      fixable: safeToFix,
+      fixDescription: safeToFix ? `pnpm remove ${pkg.name}` : null,
+      fix: safeToFix ? () => execSync(`pnpm remove ${pkg.name}`, { stdio: 'ignore', timeout: 30000 }) : null
+    });
+  }
+}
+
+/**
+ * Extract package metadata from pnpm-lock.yaml.
+ *
+ * Supports both modern keys like `axios@1.6.0:` and older keys like
+ * `/axios@1.6.0:` under the top-level `packages:` section.
+ *
+ * @param {string} content - Raw pnpm-lock.yaml text.
+ * @returns {{ name: string, hasInstallScript: boolean }[]}
+ */
+function extractPackagesFromPnpmLock(content) {
+  const results = [];
+  const lines = content.split(/\r?\n/);
+
+  let inPackages = false;
+  let currentPkg = null;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (!inPackages) {
+      if (trimmed === 'packages:') {
+        inPackages = true;
+      }
+      continue;
+    }
+
+    // Leaving the packages: section (back to another top-level YAML key)
+    if (/^\S/.test(line) && trimmed !== 'packages:') {
+      if (currentPkg) results.push(currentPkg);
+      currentPkg = null;
+      break;
+    }
+
+    // Package entry in packages: section (2-space indentation)
+    const pkgEntry = /^ {2}([^\s].*):\s*$/.exec(line);
+    if (pkgEntry) {
+      if (currentPkg) results.push(currentPkg);
+
+      const key = stripYamlQuotes(pkgEntry[1].trim());
+      const name = parsePnpmPackageNameFromKey(key);
+      currentPkg = name ? { name, hasInstallScript: false } : null;
+      continue;
+    }
+
+    if (!currentPkg) continue;
+
+    // Install-time execution indicators in package snapshot metadata
+    if (/^\s{4}hasInstallScript:\s*true\s*$/.test(line) ||
+        /^\s{4}requiresBuild:\s*true\s*$/.test(line)) {
+      currentPkg.hasInstallScript = true;
+    }
+  }
+
+  if (currentPkg) results.push(currentPkg);
+
+  // Deduplicate by name
+  const seen = new Set();
+  const deduped = [];
+  for (const pkg of results) {
+    if (!pkg || !pkg.name || seen.has(pkg.name)) continue;
+    seen.add(pkg.name);
+    deduped.push(pkg);
+  }
+  return deduped;
+}
+
+/**
+ * Remove single or double YAML quotes from a scalar key.
+ * @param {string} value - YAML key candidate.
+ * @returns {string}
+ */
+function stripYamlQuotes(value) {
+  if ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+/**
+ * Parse npm package name from a pnpm package snapshot key.
+ * Examples:
+ *   /axios@1.6.0 -> axios
+ *   @scope/pkg@2.0.0 -> @scope/pkg
+ *   /@scope/pkg@2.0.0(peer@1.0.0) -> @scope/pkg
+ *
+ * @param {string} key - Raw pnpm package key.
+ * @returns {string|null}
+ */
+function parsePnpmPackageNameFromKey(key) {
+  let normalized = key;
+  if (normalized.startsWith('/')) {
+    normalized = normalized.slice(1);
+  }
+
+  const lastAt = normalized.lastIndexOf('@');
+  if (lastAt <= 0) return null;
+
+  const name = normalized.slice(0, lastAt);
+  if (!name || !isSafePackageName(name)) return null;
+  return name;
 }
 
 /**
@@ -2914,6 +3078,9 @@ const SSRF_SCANNABLE_EXTENSIONS = ['.js', '.mjs', '.cjs', '.json'];
 /** Maximum file size (bytes) to scan per file. */
 const SSRF_MAX_FILE_SIZE = 102400;
 
+/** Maximum directory depth to scan within each dependency package. */
+const SSRF_MAX_SCAN_DEPTH = 5;
+
 /**
  * Known suspicious IP addresses associated with malware campaigns.
  * These are non-RFC1918, non-loopback addresses seen in TeamPCP and similar
@@ -2991,15 +3158,17 @@ function checkSsrfIndicators(threats, _testData) {
   }
 
   for (const pkg of packageDirs) {
-    scanPackageDir(pkg.dir, pkg.name, blockedDomains, blockedIPs, threats);
+    scanPackageDir(pkg.dir, pkg.name, pkg.dir, 0, blockedDomains, blockedIPs, threats);
   }
 }
 
 /**
- * Recursively scan a package directory for files with matching extensions,
- * up to one level of nesting (to avoid scanning nested node_modules).
+ * Recursively scan a dependency package for files with matching extensions.
+ * Skips nested node_modules to avoid rescanning transitive dependency trees.
  */
-function scanPackageDir(dir, pkgName, blockedDomains, blockedIPs, threats) {
+function scanPackageDir(dir, pkgName, packageRoot, depth, blockedDomains, blockedIPs, threats) {
+  if (depth > SSRF_MAX_SCAN_DEPTH) return;
+
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
 
@@ -3015,35 +3184,12 @@ function scanPackageDir(dir, pkgName, blockedDomains, blockedIPs, threats) {
         const stat = fs.statSync(fullPath);
         if (stat.size > SSRF_MAX_FILE_SIZE) continue;
         const content = fs.readFileSync(fullPath, 'utf8');
-        scanContentForSsrf(content, pkgName, `${pkgName}/${entry.name}`, blockedDomains, blockedIPs, threats);
+        const rel = path.relative(packageRoot, fullPath).split(path.sep).join('/');
+        scanContentForSsrf(content, pkgName, `${pkgName}/${rel}`, blockedDomains, blockedIPs, threats);
       } catch { /* unreadable file */ }
     } else if (entry.isDirectory()) {
-      // One level deeper (e.g., lib/, dist/, src/)
-      scanPackageSubdir(fullPath, pkgName, blockedDomains, blockedIPs, threats);
+      scanPackageDir(fullPath, pkgName, packageRoot, depth + 1, blockedDomains, blockedIPs, threats);
     }
-  }
-}
-
-/**
- * Scan a single subdirectory within a package (one level only).
- */
-function scanPackageSubdir(dir, pkgName, blockedDomains, blockedIPs, threats) {
-  let entries;
-  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    const ext = path.extname(entry.name).toLowerCase();
-    if (!SSRF_SCANNABLE_EXTENSIONS.includes(ext)) continue;
-
-    const fullPath = path.join(dir, entry.name);
-    try {
-      const stat = fs.statSync(fullPath);
-      if (stat.size > SSRF_MAX_FILE_SIZE) continue;
-      const content = fs.readFileSync(fullPath, 'utf8');
-      const relativePath = `${pkgName}/${path.basename(dir)}/${entry.name}`;
-      scanContentForSsrf(content, pkgName, relativePath, blockedDomains, blockedIPs, threats);
-    } catch { /* unreadable file */ }
   }
 }
 
