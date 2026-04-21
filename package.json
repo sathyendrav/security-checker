@@ -1,6 +1,6 @@
 {
   "name": "@sathyendra/security-checker",
-  "version": "1.23.0",
+  "version": "1.24.0",
   "description": "Stop npm supply-chain attacks before they execute. Zero-dependency security scanner: malicious package detection, lockfile audit, dropper detection, integrity checks, OWASP A03/A05/A08/A10 coverage, CycloneDX SBOM & VEX reports, provenance verification, secrets detection, and 18 automated security checks with auto-fix.",
   "main": "check.js",
   "bin": {
