@@ -361,6 +361,27 @@ function buildIocBatchSubmission(_options) {
 }
 
 /**
+ * Open a URL in the system default browser (cross-platform).
+ * Uses `start` on Windows, `open` on macOS, `xdg-open` on Linux.
+ * Fires and returns — does not block or wait for the browser to close.
+ * @param {string} url - The URL to open.
+ */
+function openUrl(url) {
+  const { exec } = require('child_process');
+  const platform = process.platform;
+  let cmd;
+  if (platform === 'win32') {
+    // `start` needs the URL quoted and empty title arg to handle special chars
+    cmd = `start "" "${url.replace(/"/g, '\\"')}"`;
+  } else if (platform === 'darwin') {
+    cmd = `open "${url.replace(/"/g, '\\"')}"`;
+  } else {
+    cmd = `xdg-open "${url.replace(/"/g, '\\"')}"`;
+  }
+  exec(cmd);
+}
+
+/**
  * Fetch the latest IOC database from a remote URL and save it locally.
  *
  * Security constraints:
@@ -4279,7 +4300,7 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission };
+module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow

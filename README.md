@@ -115,9 +115,12 @@ sec-check --vex-out     # Output CycloneDX VEX document (spec 1.6)
 sec-check --sbom        # Generate CycloneDX SBOM (dependency inventory)
 sec-check --update-db   # Fetch latest IOC database from trusted source
 sec-check --add-ioc <type> <value>    # Add project-local IOC (type: c2|npm|pypi)
-sec-check --submit-ioc <type> <value> # Generate prefilled GitHub issue for global IOC submission
-sec-check --submit-ioc-batch          # Generate submission URL from all local IOC entries
-sec-check --submit-ioc-batch --split  # Generate one submission URL per local IOC entry
+sec-check --submit-ioc <type> <value>        # Generate prefilled GitHub issue for global IOC submission
+sec-check --submit-ioc <type> <value> --open # Same, and immediately open in default browser
+sec-check --submit-ioc-batch                 # Generate submission URL from all local IOC entries
+sec-check --submit-ioc-batch --split         # Generate one submission URL per local IOC entry
+sec-check --submit-ioc-batch --open          # Generate and open all submission URLs in browser
+sec-check --submit-ioc-batch --split --open  # One URL per entry, open each in browser
 sec-check --help        # Show usage information
 ```
 
@@ -616,7 +619,11 @@ sec-check --submit-ioc npm malicious-typosquat
 sec-check --submit-ioc pypi fake-internal-sdk
 ```
 
-The command prints a ready-to-open `issues/new` URL with title/body template so you can attach evidence and submit quickly.
+The command prints a ready-to-open `issues/new` URL with title/body template so you can attach evidence and submit quickly. Add `--open` to launch the URL directly in your default browser:
+
+```bash
+sec-check --submit-ioc c2 bad-domain.example --open
+```
 
 ### Submit All Local IOCs at Once
 
@@ -628,6 +635,10 @@ sec-check --submit-ioc-batch
 
 # One issue per IOC entry
 sec-check --submit-ioc-batch --split
+
+# Open URL(s) directly in the default browser after generating
+sec-check --submit-ioc-batch --open
+sec-check --submit-ioc-batch --split --open
 ```
 
 This reads all entries from `.sec-check-ioc.json` and prepares ready-to-open GitHub issue URLs.

@@ -2,7 +2,7 @@
 'use strict';
 
 // Import the main security scanning logic and IOC database utilities
-const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission } = require('./check.js');
+const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -83,11 +83,13 @@ Options:
                 Generate a prefilled GitHub issue URL for submitting the IOC
                 to the upstream global database (ioc-db.json) for all users.
                 <type> must be one of: c2, npm, pypi
+                Add --open to immediately open the URL in the default browser.
   --submit-ioc-batch
                 Generate a prefilled GitHub issue URL using ALL entries in
                 .sec-check-ioc.json.
                 Add --split to generate one URL per IOC entry instead of one
                 combined issue.
+                Add --open to immediately open each URL in the default browser.
   --help        Show this help message.
 
 Exit codes:
@@ -179,6 +181,10 @@ Exit codes:
     console.log(result.body);
     console.log('\nOpen this URL to submit:');
     console.log(result.url);
+    if (args.includes('--open')) {
+      openUrl(result.url);
+      console.log('🌐 Opening URL in default browser...');
+    }
     process.exit(0);
   }
 
@@ -205,6 +211,12 @@ Exit codes:
     console.log('\nOpen URL(s) to submit:');
     for (const u of result.urls || []) {
       console.log(u);
+      if (args.includes('--open')) {
+        openUrl(u);
+      }
+    }
+    if (args.includes('--open') && (result.urls || []).length > 0) {
+      console.log('🌐 Opening URL(s) in default browser...');
     }
     process.exit(0);
   }
