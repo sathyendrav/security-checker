@@ -822,6 +822,28 @@ async function check(options = {}) {
   //     integrity hash (non-deterministic builds vulnerable to MITM).
   lockfileSentinel(threats);
 
+  // 19. Package Manager Cache IOC Scan (OWASP A08).
+  //     Scans npm (~/.npm/_cacache), yarn (~/.yarn/cache), and pnpm
+  //     (~/.pnpm-store) cache directories for package names matching the IOC
+  //     malicious-package list. A cached malicious package can be silently
+  //     re-installed from the local cache even after removal from node_modules.
+  checkPackageCacheIocs(threats);
+
+  // 20. Phantom Dependency Detection (OWASP A06).
+  //     Parses require()/import statements in project source files and flags
+  //     packages that are used but not declared in package.json. Phantom deps
+  //     work only because a transitive dependency pulled them in — making the
+  //     project fragile and vulnerable to Dependency Confusion if that
+  //     transitive dep is later removed or changed.
+  checkPhantomDependencies(threats);
+
+  // 21. Project dist/ Build Output Scan (OWASP A03/A08).
+  //     Scans dist/, build/, out/, lib/ for known malicious package names
+  //     embedded as string literals, C2 domains, and obfuscation patterns
+  //     (eval+atob, execSync+decode chains). Catches supply-chain injection
+  //     into the build pipeline before the artifact is published or deployed.
+  checkProjectDistScan(threats);
+
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
   if (!jsonMode) {
@@ -4300,7 +4322,443 @@ function formatAsVex(jsonResult) {
   };
 }
 
-module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl };
+// ─── Check 19: Package Cache IOC Scan ────────────────────────────────────────
+/**
+ * Scan the npm, yarn, and pnpm package manager cache directories for package
+ * names matching the IOC (malicious package) lists.
+ *
+ * - npm:  ~/.npm/_cacache/index-v5/ — content-addressable JSON metadata lines
+ * - yarn classic: ~/.yarn/cache/ — zip filenames like npm-pkg-version-hash.zip
+ * - yarn berry: ~/.yarn/cache/ — zip filenames like pkg-npm-version-hash.zip
+ * - pnpm: ~/.pnpm-store/v3/files/ — inspects the store integrity manifest
+ *
+ * Only package names are checked (no file content inspection inside tarballs),
+ * so this is fast and low-risk.
+ *
+ * @param {string[]} threats - Threats array to append findings to.
+ * @param {object} [_testData] - Optional test overrides.
+ * @param {string} [_testData.npmCacheDir]  - Path to npm cache index dir.
+ * @param {string} [_testData.yarnCacheDir] - Path to yarn cache dir.
+ * @param {string} [_testData.pnpmStoreDir] - Path to pnpm store dir.
+ */
+function checkPackageCacheIocs(threats, _testData) {
+  const home = os.homedir();
+  const { maliciousNpmPackages } = getEffectiveIocs();
+  const blockedSet = new Set(maliciousNpmPackages.map(p => p.toLowerCase()));
+  if (blockedSet.size === 0) return;
+
+  const found = new Set(); // deduplicate across all cache sources
+
+  // ── npm cache: ~/.npm/_cacache/index-v5/ ─────────────────────────────
+  const npmCacheDir = _testData && _testData.npmCacheDir
+    ? _testData.npmCacheDir
+    : path.join(home, '.npm', '_cacache', 'index-v5');
+
+  if (fs.existsSync(npmCacheDir)) {
+    try {
+      // Each bucket dir under index-v5/ contains flat files (no extension)
+      // with one JSON object per line. The key field encodes the package name
+      // as "make-fetch-happen:request-cache:https://registry.npmjs.org/<name>/-/..."
+      const buckets = fs.readdirSync(npmCacheDir);
+      outer: for (const bucket of buckets) {
+        const bucketPath = path.join(npmCacheDir, bucket);
+        let stat;
+        try { stat = fs.statSync(bucketPath); } catch { continue; }
+        if (!stat.isDirectory()) continue;
+
+        const entries = fs.readdirSync(bucketPath);
+        for (const entry of entries) {
+          const entryPath = path.join(bucketPath, entry);
+          let raw;
+          try {
+            const s = fs.statSync(entryPath);
+            if (!s.isFile() || s.size > 65536) continue;
+            raw = fs.readFileSync(entryPath, 'utf8');
+          } catch { continue; }
+
+          // Each line is a JSON object with a "key" field
+          for (const line of raw.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('{')) continue;
+            let obj;
+            try { obj = JSON.parse(trimmed); } catch { continue; }
+            const key = typeof obj.key === 'string' ? obj.key : '';
+            // Extract package name from URL: .../registry.npmjs.org/<name>/-/...
+            const m = key.match(/registry\.npmjs\.org\/(@[^/]+\/[^/]+|[^/]+)\/-\//);
+            if (m) {
+              const pkgName = m[1].toLowerCase();
+              if (blockedSet.has(pkgName) && !found.has('npm:' + pkgName)) {
+                found.add('npm:' + pkgName);
+                threats.push({
+                  message: `CACHE_IOC: Malicious package "${pkgName}" found in npm cache (~/.npm). Run \`npm cache clean --force\` to purge it (OWASP A08)`,
+                  category: 'CACHE_IOC',
+                  fixable: true,
+                  fixDescription: 'npm cache clean --force',
+                  fix: () => execSync('npm cache clean --force', { stdio: 'ignore', timeout: 30000 })
+                });
+              }
+            }
+          }
+          if (found.size > 20) break outer; // safety cap
+        }
+      }
+    } catch { /* cache dir unreadable */ }
+  }
+
+  // ── yarn cache: ~/.yarn/cache/ ────────────────────────────────────────
+  // Filename format: npm-<pkg>-<version>-<hash>.zip  OR  <pkg>-npm-<version>-<hash>.zip
+  const yarnCacheDir = _testData && _testData.yarnCacheDir
+    ? _testData.yarnCacheDir
+    : path.join(home, '.yarn', 'cache');
+
+  if (fs.existsSync(yarnCacheDir)) {
+    try {
+      const files = fs.readdirSync(yarnCacheDir);
+      for (const file of files) {
+        if (!file.endsWith('.zip')) continue;
+        // Classic: npm-<pkg>-<semver>-<hash>.zip
+        // Berry:   <pkg>-npm-<semver>-<hash>.zip
+        let pkgName = null;
+        const classicMatch = file.match(/^npm-(@[^-]+(?:-[^-]+)?|[^@][^-]*(?:-[^-]*)*?)-\d+\.\d+/);
+        if (classicMatch) {
+          pkgName = classicMatch[1].toLowerCase();
+        } else {
+          const berryMatch = file.match(/^((?:@[^-]+\/)?[^-]+(?:-[^-]+)*?)-npm-\d+\.\d+/);
+          if (berryMatch) pkgName = berryMatch[1].toLowerCase();
+        }
+        if (pkgName && blockedSet.has(pkgName) && !found.has('yarn:' + pkgName)) {
+          found.add('yarn:' + pkgName);
+          threats.push({
+            message: `CACHE_IOC: Malicious package "${pkgName}" found in yarn cache (~/.yarn/cache). Run \`yarn cache clean\` to purge it (OWASP A08)`,
+            category: 'CACHE_IOC',
+            fixable: false,
+            fixDescription: 'Run: yarn cache clean'
+          });
+        }
+      }
+    } catch { /* cache dir unreadable */ }
+  }
+
+  // ── pnpm store: ~/.pnpm-store/v3/ ────────────────────────────────────
+  // The store has a lock/ directory with JSON files mapping package IDs.
+  // Package IDs are formatted as: registry.npmjs.org/<name>/<version>
+  const pnpmStoreDir = _testData && _testData.pnpmStoreDir
+    ? _testData.pnpmStoreDir
+    : path.join(home, '.pnpm-store', 'v3');
+
+  if (fs.existsSync(pnpmStoreDir)) {
+    const pnpmLockDir = path.join(pnpmStoreDir, 'lock');
+    if (fs.existsSync(pnpmLockDir)) {
+      try {
+        const lockFiles = fs.readdirSync(pnpmLockDir);
+        for (const lf of lockFiles) {
+          if (!lf.endsWith('.json')) continue;
+          let lockData;
+          try {
+            const raw = fs.readFileSync(path.join(pnpmLockDir, lf), 'utf8');
+            lockData = JSON.parse(raw);
+          } catch { continue; }
+
+          // Lock manifest keys are like "registry.npmjs.org/<name>/<version>"
+          for (const key of Object.keys(lockData)) {
+            const m = key.match(/registry\.npmjs\.org\/(.+?)\//);
+            if (m) {
+              const pkgName = m[1].toLowerCase();
+              if (blockedSet.has(pkgName) && !found.has('pnpm:' + pkgName)) {
+                found.add('pnpm:' + pkgName);
+                threats.push({
+                  message: `CACHE_IOC: Malicious package "${pkgName}" found in pnpm store (~/.pnpm-store). Run \`pnpm store prune\` to purge it (OWASP A08)`,
+                  category: 'CACHE_IOC',
+                  fixable: false,
+                  fixDescription: 'Run: pnpm store prune'
+                });
+              }
+            }
+          }
+        }
+      } catch { /* store dir unreadable */ }
+    }
+  }
+}
+
+// ─── Check 20: Phantom Dependency Detection ───────────────────────────────────
+/**
+ * Detect phantom (ghost) dependencies — packages that are `require()`d or
+ * `import`ed in the project source but are not listed in package.json under
+ * any of: dependencies, devDependencies, peerDependencies, optionalDependencies.
+ *
+ * Such packages only work because they happen to be installed by another
+ * dependency (transitive install), making the project fragile and opening it
+ * to dependency confusion if the transitive dep is ever removed.
+ *
+ * Scans: *.js, *.mjs, *.cjs, *.ts, *.tsx files in project root (not node_modules,
+ * not dist/, not build/).
+ *
+ * @param {string[]} threats  - Threats array to append findings to.
+ * @param {object} [_testData] - Optional test overrides.
+ * @param {string} [_testData.projectDir] - Directory under test.
+ * @param {object} [_testData.pkg] - Simulated package.json object.
+ * @param {Object<string, string>} [_testData.sourceFiles] - Map of filename → content.
+ */
+function checkPhantomDependencies(threats, _testData) {
+  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : process.cwd();
+
+  // Load package.json
+  let pkg;
+  if (_testData && _testData.pkg) {
+    pkg = _testData.pkg;
+  } else {
+    try {
+      pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8'));
+    } catch { return; } // no package.json — skip
+  }
+
+  // Build set of declared packages (all dependency fields)
+  const declared = new Set();
+  for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies', 'bundledDependencies', 'bundleDependencies']) {
+    const deps = pkg[field];
+    if (deps && typeof deps === 'object') {
+      for (const name of Object.keys(deps)) {
+        declared.add(name.toLowerCase());
+      }
+    }
+  }
+
+  // Node.js built-in module list (Node 18+)
+  const BUILTINS = new Set([
+    'assert', 'assert/strict', 'async_hooks', 'buffer', 'child_process', 'cluster',
+    'console', 'constants', 'crypto', 'dgram', 'diagnostics_channel', 'dns', 'dns/promises',
+    'domain', 'events', 'fs', 'fs/promises', 'http', 'http2', 'https', 'inspector',
+    'module', 'net', 'os', 'path', 'path/posix', 'path/win32', 'perf_hooks', 'process',
+    'punycode', 'querystring', 'readline', 'readline/promises', 'repl', 'stream',
+    'stream/consumers', 'stream/promises', 'stream/web', 'string_decoder', 'sys',
+    'timers', 'timers/promises', 'tls', 'trace_events', 'tty', 'url', 'util',
+    'util/types', 'v8', 'vm', 'wasi', 'worker_threads', 'zlib',
+    // node: prefix variants
+    'node:assert', 'node:buffer', 'node:child_process', 'node:cluster', 'node:console',
+    'node:crypto', 'node:dgram', 'node:dns', 'node:events', 'node:fs', 'node:http',
+    'node:http2', 'node:https', 'node:module', 'node:net', 'node:os', 'node:path',
+    'node:process', 'node:readline', 'node:stream', 'node:string_decoder', 'node:timers',
+    'node:tls', 'node:tty', 'node:url', 'node:util', 'node:v8', 'node:vm',
+    'node:worker_threads', 'node:zlib'
+  ]);
+
+  // Regexes to extract import specifiers
+  const REQUIRE_RE = /\brequire\s*\(\s*['"`]([^'"`\s]+)['"`]\s*\)/g;
+  const IMPORT_RE = /\bimport\s+(?:[^'"]+\s+from\s+)?['"`]([^'"`\s]+)['"`]/g;
+  const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*['"`]([^'"`\s]+)['"`]\s*\)/g;
+
+  // Skip dirs that are not project source
+  const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', 'out', '.git', 'coverage', '.nyc_output', 'test', 'tests', '__tests__']);
+
+  const phantom = new Set();
+
+  /**
+   * Extract bare package name from an import specifier.
+   * "@scope/pkg/subpath" → "@scope/pkg", "pkg/subpath" → "pkg"
+   */
+  function extractPkgName(specifier) {
+    if (specifier.startsWith('.') || specifier.startsWith('/')) return null; // relative/absolute
+    if (BUILTINS.has(specifier)) return null;
+    const parts = specifier.split('/');
+    if (specifier.startsWith('@') && parts.length >= 2) {
+      return (parts[0] + '/' + parts[1]).toLowerCase();
+    }
+    return parts[0].toLowerCase();
+  }
+
+  function scanFile(content) {
+    const specifiers = new Set();
+    let m;
+    REQUIRE_RE.lastIndex = 0;
+    while ((m = REQUIRE_RE.exec(content)) !== null) specifiers.add(m[1]);
+    IMPORT_RE.lastIndex = 0;
+    while ((m = IMPORT_RE.exec(content)) !== null) specifiers.add(m[1]);
+    DYNAMIC_IMPORT_RE.lastIndex = 0;
+    while ((m = DYNAMIC_IMPORT_RE.exec(content)) !== null) specifiers.add(m[1]);
+    return specifiers;
+  }
+
+  function walkDir(dir, depth) {
+    if (depth > 4) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+
+    for (const entry of entries) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      const fullPath = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        walkDir(fullPath, depth + 1);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (!['.js', '.mjs', '.cjs', '.ts', '.tsx'].includes(ext)) continue;
+        let content;
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.size > 524288) continue; // skip files > 512KB
+          content = fs.readFileSync(fullPath, 'utf8');
+        } catch { continue; }
+
+        for (const specifier of scanFile(content)) {
+          const pkgName = extractPkgName(specifier);
+          if (pkgName && !declared.has(pkgName) && !phantom.has(pkgName)) {
+            phantom.add(pkgName);
+          }
+        }
+      }
+    }
+  }
+
+  if (_testData && _testData.sourceFiles) {
+    // Test path: scan provided file contents directly
+    for (const content of Object.values(_testData.sourceFiles)) {
+      for (const specifier of scanFile(content)) {
+        const pkgName = extractPkgName(specifier);
+        if (pkgName && !declared.has(pkgName) && !phantom.has(pkgName)) {
+          phantom.add(pkgName);
+        }
+      }
+    }
+  } else {
+    walkDir(projectDir, 0);
+  }
+
+  for (const pkgName of phantom) {
+    threats.push({
+      message: `PHANTOM_DEP: "${pkgName}" is imported in source but not listed in package.json — phantom dependency (transitive-only). Declare it explicitly or remove the import to prevent breakage and Dependency Confusion attacks (OWASP A06)`,
+      category: 'PHANTOM_DEP',
+      fixable: false,
+      fixDescription: `Add "${pkgName}" to package.json dependencies or devDependencies`
+    });
+  }
+}
+
+// ─── Check 21: Project dist/ Build Output Scan ───────────────────────────────
+/**
+ * Scan the project's own compiled/bundled output directories (dist/, build/,
+ * out/) for indicators of a tampered or backdoored build:
+ *   - Known malicious package names embedded as string literals
+ *   - Known C2 domains / suspicious IPs
+ *   - High-risk obfuscation patterns (eval + atob, Buffer + base64 decode chains)
+ *
+ * This differs from checkSsrfIndicators (which scans node_modules/) — here we
+ * scan YOUR output to catch supply-chain injection into the build pipeline.
+ *
+ * @param {string[]} threats  - Threats array to append findings to.
+ * @param {object} [_testData] - Optional test overrides.
+ * @param {string} [_testData.projectDir] - Directory under test.
+ * @param {Object<string, string>} [_testData.distFiles] - Map of relative path → content.
+ */
+function checkProjectDistScan(threats, _testData) {
+  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : process.cwd();
+  const { c2Domains, maliciousNpmPackages } = getEffectiveIocs();
+  const blockedDomains = new Set(c2Domains.map(d => d.toLowerCase()));
+  const blockedPkgs = new Set(maliciousNpmPackages.map(p => p.toLowerCase()));
+
+  // Patterns that suggest obfuscated payload execution in bundled output
+  const DIST_SUSPICIOUS_PATTERNS = [
+    { re: /eval\s*\(\s*(?:atob|Buffer\.from|unescape)\s*\(/, label: 'eval+decode chain' },
+    { re: /\bexecSync\s*\(\s*(?:atob|Buffer\.from|require\('child_process'\))/, label: 'execSync+decode' },
+    { re: /process\.env\.NODE_OPTIONS\s*=/, label: 'NODE_OPTIONS override in bundle' },
+    { re: /require\s*\(['"`](?:child_process|vm)['"`]\)\s*.*\bexec/, label: 'dynamic exec in bundle' },
+  ];
+
+  const DIST_DIRS = ['dist', 'build', 'out', 'lib'];
+  const DIST_MAX_FILE_SIZE = 524288; // 512 KB
+  const DIST_SCANNABLE = new Set(['.js', '.mjs', '.cjs', '.json', '.map']);
+  const reported = new Set();
+
+  function scanDistContent(content, relPath) {
+    const lower = content.toLowerCase();
+
+    // Check for known malicious package names as string literals
+    for (const pkgName of blockedPkgs) {
+      if (lower.includes(pkgName) && !reported.has('pkg:' + pkgName)) {
+        reported.add('pkg:' + pkgName);
+        threats.push({
+          message: `DIST_IOC: Malicious package name "${pkgName}" found as string literal in build output "${relPath}" — your bundle may include a compromised dependency (OWASP A08)`,
+          category: 'DIST_IOC',
+          fixable: false,
+          fixDescription: 'Audit your dependency tree and rebuild after removing the malicious package'
+        });
+      }
+    }
+
+    // Check for C2 domains
+    const urlRe = /(?:https?|wss?):\/\/([a-zA-Z0-9._-]+)/g;
+    let m;
+    while ((m = urlRe.exec(content)) !== null) {
+      const domain = m[1].toLowerCase();
+      if (blockedDomains.has(domain) && !reported.has('c2:' + domain)) {
+        reported.add('c2:' + domain);
+        threats.push({
+          message: `DIST_IOC: Known C2 domain "${domain}" found in build output "${relPath}" — bundle may contain a backdoor (OWASP A08)`,
+          category: 'DIST_IOC',
+          fixable: false,
+          fixDescription: 'Audit your build pipeline and dependency tree for injected malware'
+        });
+      }
+    }
+
+    // Check for obfuscation patterns
+    for (const { re, label } of DIST_SUSPICIOUS_PATTERNS) {
+      const key = 'obf:' + relPath + ':' + label;
+      if (!reported.has(key) && re.test(content)) {
+        reported.add(key);
+        threats.push({
+          message: `DIST_SUSPICIOUS: "${label}" pattern in build output "${relPath}" — may indicate an injected obfuscated payload (OWASP A03)`,
+          category: 'DIST_SUSPICIOUS',
+          fixable: false,
+          fixDescription: 'Review the source file and build pipeline for unexpected code injection'
+        });
+      }
+    }
+  }
+
+  function walkDistDir(dir, baseDir, depth) {
+    if (depth > 6) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+
+    for (const entry of entries) {
+      if (entry.name === 'node_modules') continue;
+      const fullPath = path.join(dir, entry.name);
+      const relPath = path.relative(baseDir, fullPath).split(path.sep).join('/');
+
+      if (entry.isDirectory()) {
+        walkDistDir(fullPath, baseDir, depth + 1);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (!DIST_SCANNABLE.has(ext)) continue;
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.size > DIST_MAX_FILE_SIZE) continue;
+          const content = fs.readFileSync(fullPath, 'utf8');
+          scanDistContent(content, relPath);
+        } catch { /* unreadable */ }
+      }
+    }
+  }
+
+  if (_testData && _testData.distFiles) {
+    // Test path
+    for (const [relPath, content] of Object.entries(_testData.distFiles)) {
+      scanDistContent(content, relPath);
+    }
+    return;
+  }
+
+  // Real path: scan each output dir if present
+  for (const dirName of DIST_DIRS) {
+    const distPath = path.join(projectDir, dirName);
+    if (fs.existsSync(distPath)) {
+      walkDistDir(distPath, distPath, 0);
+    }
+  }
+}
+
+module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow
