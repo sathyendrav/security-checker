@@ -1052,13 +1052,17 @@ function checkTeamPCPArtifacts(sys, threats) {
  * npm (Axios, Trivy, KICS) and PyPI (LiteLLM, Telnyx) ecosystems.
  */
 const C2_DOMAINS = [
-  'sfrclak.com',           // Original Axios C2
-  'cfrclak.com',           // Typo-variant C2
-  'actsyncmond.com',       // macOS LaunchAgent callback
-  'edgeupdater.net',       // Windows persistence callback
-  'dbus-notifyd.com',      // Linux systemd callback
-  'syncdefaultsd.com',     // macOS variant
-  'cache-updater.net',     // Cross-platform staging callback
+  'sfrclak.com',                              // Original Axios C2
+  'cfrclak.com',                              // Typo-variant C2
+  'actsyncmond.com',                          // macOS LaunchAgent callback
+  'edgeupdater.net',                          // Windows persistence callback
+  'dbus-notifyd.com',                         // Linux systemd callback
+  'syncdefaultsd.com',                        // macOS variant
+  'cache-updater.net',                        // Cross-platform staging callback
+  'freefan.net',                              // SANDWORM_MODE DNS exfiltration (primary)
+  'fanfree.net',                              // SANDWORM_MODE DNS exfiltration (secondary)
+  'pkg-metrics.official334.workers.dev',      // SANDWORM_MODE Cloudflare Worker C2
+  'telemetry.api-monitor.com',                // CanisterSprawl/Namastex exfiltration webhook
 ];
 
 /**
@@ -1105,6 +1109,28 @@ const MALICIOUS_PACKAGES = [
   'ua-parser-js-infected', // Hijacked ua-parser-js with crypto-miner payload
   'rc-compromised',        // Compromised rc package variant
   'coa-compromised',       // Compromised coa package variant
+  // SANDWORM_MODE campaign (Feb 2026) — typosquats & look-alikes by threat actor official334/javaorg
+  'suport-color',          // Typosquat of supports-color — worm dropper
+  'claud-code',            // Fake Claude Code — AI toolchain poisoning
+  'cloude-code',           // Fake Claude Code variant — AI toolchain poisoning
+  'cloude',                // Fake Claude variant — AI toolchain poisoning
+  'opencraw',              // Typosquat of OpenClaw AI agent
+  'rimarf',                // Typosquat of rimraf — MCP server injector
+  'veim',                  // Typosquat of viem (Ethereum library)
+  'yarsg',                 // Typosquat of yargs
+  'scan-store',            // SANDWORM_MODE carrier — chunked payload dropper
+  'crypto-reader-info',    // SANDWORM_MODE — credential stealer
+  'format-defaults',       // SANDWORM_MODE — credential stealer
+  'detect-cache',          // SANDWORM_MODE — credential stealer
+  'parse-compat',          // SANDWORM_MODE — credential stealer
+  'locale-loader-pro',     // SANDWORM_MODE — credential stealer
+  'node-native-bridge',    // SANDWORM_MODE — credential stealer
+  'hardhta',               // SANDWORM_MODE — credential stealer
+  'naniod',                // SANDWORM_MODE — credential stealer
+  'secp256',               // SANDWORM_MODE — fake secp256k1 crypto library
+  'crypto-locale',         // SANDWORM_MODE — credential stealer
+  // CanisterSprawl campaign (Apr 2026) — Namastex publisher compromise
+  'pgserve',               // Compromised pgserve (versions 1.1.11–1.1.13) — canister C2 backdoor
 ];
 
 /**
@@ -5343,7 +5369,10 @@ const INIT_SCRIPTS = {
  * @returns {object} Result: { ok, added[], skipped[], pkg (after), error? }.
  */
 function initShield(_testData) {
-  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : process.cwd();
+  // When running as a postinstall hook, npm sets INIT_CWD to the consumer's
+  // project root. process.cwd() would point inside node_modules/ instead.
+  const defaultDir = process.env.INIT_CWD || process.cwd();
+  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : defaultDir;
   const pkgPath = path.join(projectDir, 'package.json');
   const dryRun = _testData && _testData.dryRun;
 
@@ -5364,6 +5393,12 @@ function initShield(_testData) {
     pkg = JSON.parse(raw);
   } catch (err) {
     return { ok: false, added: [], skipped: [], error: `package.json is not valid JSON: ${err.message}` };
+  }
+
+  // ── Self-install guard: never patch our own package.json ─────────────
+  // Triggered when a developer runs `npm install` inside this repo itself.
+  if (pkg.name === '@sathyendra/security-checker') {
+    return { ok: true, added: [], skipped: [], selfInstall: true };
   }
 
   // ── Ensure scripts section exists ────────────────────────────────────

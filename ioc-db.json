@@ -6,7 +6,11 @@
     "edgeupdater.net",
     "dbus-notifyd.com",
     "syncdefaultsd.com",
-    "cache-updater.net"
+    "cache-updater.net",
+    "freefan.net",
+    "fanfree.net",
+    "pkg-metrics.official334.workers.dev",
+    "telemetry.api-monitor.com"
   ],
   "maliciousNpmPackages": [
     "plain-crypto-js",
@@ -14,7 +18,27 @@
     "event-stream",
     "ua-parser-js-infected",
     "rc-compromised",
-    "coa-compromised"
+    "coa-compromised",
+    "suport-color",
+    "claud-code",
+    "cloude-code",
+    "cloude",
+    "opencraw",
+    "rimarf",
+    "veim",
+    "yarsg",
+    "scan-store",
+    "crypto-reader-info",
+    "format-defaults",
+    "detect-cache",
+    "parse-compat",
+    "locale-loader-pro",
+    "node-native-bridge",
+    "hardhta",
+    "naniod",
+    "secp256",
+    "crypto-locale",
+    "pgserve"
   ],
   "maliciousPypiPackages": [
     "litellm-proxy",

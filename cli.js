@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
+
 // Import the main security scanning logic and IOC database utilities
 const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl } = require('./check.js');
 
@@ -58,6 +61,8 @@ Options:
                   "preinstall": "sec-check --pre"  (lockfile + env scan before install)
                   "secure-install": "npm install --ignore-scripts && sec-check"
                 Existing scripts are never overwritten.
+                Note: This also runs automatically when you install the package
+                via npm install --save-dev @sathyendra/security-checker.
   --approve <p> Add package <p> to the project-local approved list
                 (.sec-check-approved.json). Approved packages are skipped
                 during Dependency Script Sandboxing (step 17).
@@ -221,12 +226,53 @@ Exit codes:
     process.exit(0);
   }
 
+  // Handle --on-install: postinstall hook — chdir to consumer's project,
+  // patch their package.json with security scripts, then run a full scan.
+  // Always exits 0 so npm install is never marked as failed.
+  if (args.includes('--on-install')) {
+    const targetDir = process.env.INIT_CWD || process.cwd();
+    if (targetDir !== process.cwd()) {
+      try { process.chdir(targetDir); } catch (_) { /* fall back to cwd */ }
+    }
+
+    // Self-install guard: don't auto-configure or scan this package itself.
+    let targetPkg = {};
+    try { targetPkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')); } catch (_) {}
+    if (targetPkg.name === '@sathyendra/security-checker') {
+      process.exit(0);
+    }
+
+    // Patch the consumer's package.json with preinstall + secure-install scripts.
+    const initResult = initShield();
+    if (initResult.ok && initResult.added && initResult.added.length > 0) {
+      console.log('\n🛡️  @sathyendra/security-checker — Auto-Setup');
+      console.log('   Added security scripts to your package.json:\n');
+      for (const s of initResult.added) {
+        console.log(`   "${s.name}": "${s.cmd}"`);
+      }
+      console.log();
+    }
+
+    // Run a full security scan of the consumer's project.
+    // Non-blocking: exit 0 regardless of findings so npm install succeeds.
+    // The consumer can run `sec-check --fix` to remediate.
+    try {
+      await check({ fix: false, json: false });
+    } catch (_) { /* scan errors are non-fatal during install */ }
+
+    process.exit(0);
+  }
+
   // Handle --init: auto-configure package.json with security scripts
   if (args.includes('--init')) {
     const result = initShield();
     if (!result.ok) {
       console.error(`❌ ${result.error}`);
       process.exit(1);
+    }
+    // Self-install guard: running inside this package's own repo — nothing to do.
+    if (result.selfInstall) {
+      process.exit(0);
     }
     if (result.added.length > 0) {
       console.log('✅ Added the following scripts to package.json:\n');

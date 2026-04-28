@@ -86,13 +86,14 @@ $ npx @sathyendra/security-checker
 # Scan any project (no install needed)
 npx @sathyendra/security-checker
 
-# Or install as a dev dependency
+# Install as a dev dependency
+# Automatically runs a full security scan + adds preinstall & secure-install scripts
 npm install --save-dev @sathyendra/security-checker
 
 # Auto-fix what can be fixed
 sec-check --fix
 
-# Protect every future install (adds preinstall hook)
+# Re-run setup manually (adds preinstall hook if not already present)
 sec-check --init
 
 # Full Zero Trust workflow: scan → safe install → verify
@@ -232,7 +233,34 @@ Example output:
 
 ## Auto-Setup (`--init`)
 
-Automatically configure your `package.json` with security scripts in one command:
+When you install the package, setup runs **automatically** — no extra step needed:
+
+```bash
+npm install --save-dev @sathyendra/security-checker
+```
+
+The `postinstall` hook fires immediately and does two things:
+
+1. **Patches your `package.json`** with security scripts (if not already present)
+2. **Runs a full security scan** of your project and prints a Diagnostic Report
+
+Example output during install:
+
+```
+🛡️  @sathyendra/security-checker — Auto-Setup
+   Added security scripts to your package.json:
+
+   "preinstall": "sec-check --pre"
+   "secure-install": "npm install --ignore-scripts && sec-check"
+
+──────────────────────────────────────────────────────────────────────
+  @sathyendra/security-checker — Diagnostic Report
+──────────────────────────────────────────────────────────────────────
+  ✅ No threats detected — project is clean
+──────────────────────────────────────────────────────────────────────
+```
+
+You can also run setup manually at any time:
 
 ```bash
 sec-check --init
@@ -255,15 +283,6 @@ This adds the following scripts:
 | `secure-install` | Manual alternative to `npm install` — downloads packages with scripts disabled, then runs a full security scan |
 
 Existing scripts are **never overwritten**. If a script already exists, `--init` will skip it and show what it wanted to add so you can merge manually.
-
-Example output:
-
-```
-✅ Added the following scripts to package.json:
-
-   "preinstall": "sec-check --pre"
-   "secure-install": "npm install --ignore-scripts && sec-check"
-```
 
 ## Dependency Script Sandboxing (`--approve`)
 
