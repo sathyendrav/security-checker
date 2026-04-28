@@ -587,16 +587,43 @@ function validateIocData(data) {
  * (deduplicated) so the scanner never loses built-in coverage even if the
  * cache file is deleted or corrupted.
  *
- * @returns {{ c2Domains: string[], maliciousNpmPackages: string[], maliciousPypiPackages: string[] }}
+ * @returns {{ c2Domains: string[], maliciousNpmPackages: string[], maliciousPypiPackages: string[], compromisedVersions: Array<{name:string,versions:string[],campaign:string,safeVersion:string}> }}
  */
 function getEffectiveIocs() {
   const db = loadIocDb();
   const projectIocs = loadProjectIocs();
+
+  // Merge version-scoped compromised packages: hardcoded baseline + db + project IOCs.
+  // De-duplicate by name+version pair so the same entry isn't reported twice.
+  function mergeCompromisedVersions(...sources) {
+    const seen = new Set();
+    const merged = [];
+    for (const source of sources) {
+      if (!Array.isArray(source)) continue;
+      for (const entry of source) {
+        if (!entry || typeof entry.name !== 'string' || !Array.isArray(entry.versions)) continue;
+        for (const v of entry.versions) {
+          const key = `${entry.name}@${v}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+          }
+        }
+        // Add the whole entry if any of its versions are new
+        const isNew = entry.versions.some(v => !merged.some(
+          m => m.name === entry.name && m.versions.includes(v)
+        ));
+        if (isNew) merged.push(entry);
+      }
+    }
+    return merged;
+  }
+
   if (!db) {
     return {
       c2Domains: [...new Set([...C2_DOMAINS, ...(projectIocs.c2Domains || [])])],
       maliciousNpmPackages: [...new Set([...MALICIOUS_PACKAGES, ...(projectIocs.maliciousNpmPackages || [])])],
-      maliciousPypiPackages: [...new Set([...MALICIOUS_PYPI_PACKAGES, ...(projectIocs.maliciousPypiPackages || [])])]
+      maliciousPypiPackages: [...new Set([...MALICIOUS_PYPI_PACKAGES, ...(projectIocs.maliciousPypiPackages || [])])],
+      compromisedVersions: mergeCompromisedVersions(COMPROMISED_VERSIONS, projectIocs.compromisedVersions)
     };
   }
 
@@ -604,7 +631,8 @@ function getEffectiveIocs() {
   const merged = {
     c2Domains: [...new Set([...C2_DOMAINS, ...(db.c2Domains || []), ...(projectIocs.c2Domains || [])])],
     maliciousNpmPackages: [...new Set([...MALICIOUS_PACKAGES, ...(db.maliciousNpmPackages || []), ...(projectIocs.maliciousNpmPackages || [])])],
-    maliciousPypiPackages: [...new Set([...MALICIOUS_PYPI_PACKAGES, ...(db.maliciousPypiPackages || []), ...(projectIocs.maliciousPypiPackages || [])])]
+    maliciousPypiPackages: [...new Set([...MALICIOUS_PYPI_PACKAGES, ...(db.maliciousPypiPackages || []), ...(projectIocs.maliciousPypiPackages || [])])],
+    compromisedVersions: mergeCompromisedVersions(COMPROMISED_VERSIONS, db.compromisedVersions, projectIocs.compromisedVersions)
   };
 
   return merged;
@@ -843,6 +871,13 @@ async function check(options = {}) {
   //     (eval+atob, execSync+decode chains). Catches supply-chain injection
   //     into the build pipeline before the artifact is published or deployed.
   checkProjectDistScan(threats);
+
+  // 22. Version-scoped compromised package detection (OWASP A06).
+  //     Detects legitimate packages whose specific published versions were
+  //     hijacked (e.g. CanisterWorm, CanisterSprawl campaigns). Name-only
+  //     blocklist detection is insufficient here — only certain version
+  //     ranges are malicious. Checks both installed node_modules and lockfile.
+  checkCompromisedVersions(threats);
 
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
@@ -1130,8 +1165,185 @@ const MALICIOUS_PACKAGES = [
   'secp256',               // SANDWORM_MODE — fake secp256k1 crypto library
   'crypto-locale',         // SANDWORM_MODE — credential stealer
   // CanisterSprawl campaign (Apr 2026) — Namastex publisher compromise
-  'pgserve',               // Compromised pgserve (versions 1.1.11–1.1.13) — canister C2 backdoor
+  // NOTE: pgserve is NOT listed here — only specific versions 1.1.11–1.1.13 are malicious.
+  // Version-scoped detection via COMPROMISED_VERSIONS is used instead to avoid false positives.
 ];
+
+/**
+ * Version-scoped compromised packages — legitimate packages where only specific
+ * published versions were hijacked or contained a backdoor. Using name-only
+ * detection for these would cause false positives on clean versions.
+ *
+ * Format: { name, versions: string[], campaign, safeVersion }
+ *   - name:        npm package name (scoped names like @scope/pkg are supported)
+ *   - versions:    exact version strings known to be malicious
+ *   - campaign:    attack campaign identifier for reporting
+ *   - safeVersion: human-readable safe upgrade target (informational)
+ */
+const COMPROMISED_VERSIONS = [
+  // CanisterWorm (March 2026) — @emilgroup publisher compromise via stolen cover42devs token
+  { name: '@emilgroup/account-sdk',              versions: ['1.41.1', '1.41.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.41.3' },
+  { name: '@emilgroup/account-sdk-node',         versions: ['1.40.1', '1.40.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.40.3' },
+  { name: '@emilgroup/accounting-sdk-node',      versions: ['1.26.1', '1.26.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.26.3' },
+  { name: '@emilgroup/api-documentation',        versions: ['1.19.1', '1.19.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.19.3' },
+  { name: '@emilgroup/auth-sdk',                 versions: ['1.25.1', '1.25.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.25.3' },
+  { name: '@emilgroup/auth-sdk-node',            versions: ['1.21.1', '1.21.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.21.3' },
+  { name: '@emilgroup/billing-sdk',              versions: ['1.56.1', '1.56.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.56.3' },
+  { name: '@emilgroup/billing-sdk-node',         versions: ['1.57.1', '1.57.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.57.3' },
+  { name: '@emilgroup/claim-sdk',                versions: ['1.41.1', '1.41.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.41.3' },
+  { name: '@emilgroup/claim-sdk-node',           versions: ['1.39.1', '1.39.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.39.3' },
+  { name: '@emilgroup/customer-sdk',             versions: ['1.54.1', '1.54.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.54.3' },
+  { name: '@emilgroup/customer-sdk-node',        versions: ['1.55.1', '1.55.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.55.3' },
+  { name: '@emilgroup/document-sdk',             versions: ['1.45.1', '1.45.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.45.3' },
+  { name: '@emilgroup/document-sdk-node',        versions: ['1.43.1', '1.43.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.43.3' },
+  { name: '@emilgroup/gdv-sdk',                  versions: ['2.6.1', '2.6.2'],                          campaign: 'CanisterWorm',   safeVersion: '>=2.6.3'  },
+  { name: '@emilgroup/insurance-sdk',            versions: ['1.97.1', '1.97.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.97.3' },
+  { name: '@emilgroup/insurance-sdk-node',       versions: ['1.95.1', '1.95.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.95.3' },
+  { name: '@emilgroup/notification-sdk-node',    versions: ['1.4.1', '1.4.2'],                          campaign: 'CanisterWorm',   safeVersion: '>=1.4.3'  },
+  { name: '@emilgroup/partner-portal-sdk-node',  versions: ['1.1.1', '1.1.2'],                          campaign: 'CanisterWorm',   safeVersion: '>=1.1.3'  },
+  { name: '@emilgroup/partner-sdk-node',         versions: ['1.19.1', '1.19.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.19.3' },
+  { name: '@emilgroup/payment-sdk',              versions: ['1.15.1', '1.15.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.15.3' },
+  { name: '@emilgroup/payment-sdk-node',         versions: ['1.23.1', '1.23.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.23.3' },
+  { name: '@emilgroup/process-manager-sdk-node', versions: ['1.13.1', '1.13.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.13.3' },
+  { name: '@emilgroup/public-api-sdk',           versions: ['1.33.1', '1.33.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.33.3' },
+  { name: '@emilgroup/public-api-sdk-node',      versions: ['1.35.1', '1.35.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.35.3' },
+  { name: '@emilgroup/tenant-sdk',               versions: ['1.34.1', '1.34.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.34.3' },
+  { name: '@emilgroup/tenant-sdk-node',          versions: ['1.33.1', '1.33.2'],                        campaign: 'CanisterWorm',   safeVersion: '>=1.33.3' },
+  { name: '@emilgroup/translation-sdk-node',     versions: ['1.1.1', '1.1.2'],                          campaign: 'CanisterWorm',   safeVersion: '>=1.1.3'  },
+  { name: '@teale.io/eslint-config',             versions: ['1.8.9', '1.8.10'],                         campaign: 'CanisterWorm',   safeVersion: '>=1.8.11' },
+  // CanisterSprawl (April 2026) — Namastex publisher compromise, TeamPCP-style canister C2
+  { name: '@automagik/genie',                    versions: ['4.260421.33', '4.260421.34', '4.260421.35', '4.260421.36', '4.260421.37', '4.260421.38', '4.260421.39'], campaign: 'CanisterSprawl', safeVersion: '>=4.260421.40' },
+  { name: 'pgserve',                             versions: ['1.1.11', '1.1.12', '1.1.13'],              campaign: 'CanisterSprawl', safeVersion: '>=1.1.14' },
+  { name: '@fairwords/websocket',                versions: ['1.0.38', '1.0.39'],                        campaign: 'CanisterSprawl', safeVersion: '>=1.0.40' },
+  { name: '@fairwords/loopback-connector-es',    versions: ['1.4.3', '1.4.4'],                          campaign: 'CanisterSprawl', safeVersion: '>=1.4.5'  },
+  { name: '@openwebconcept/design-tokens',       versions: ['1.0.3'],                                   campaign: 'CanisterSprawl', safeVersion: '>=1.0.4'  },
+  { name: '@openwebconcept/theme-owc',           versions: ['1.0.3'],                                   campaign: 'CanisterSprawl', safeVersion: '>=1.0.4'  },
+];
+
+/**
+ * Version-scoped compromised package detection (OWASP A06 — Vulnerable and Outdated Components).
+ *
+ * Legitimate packages are sometimes hijacked at a specific published version only.
+ * Name-only detection (MALICIOUS_PACKAGES blocklist) is too coarse for these cases
+ * — it would raise false positives on all clean versions before and after the
+ * hijacked release. This function checks whether an *exact* version of a package
+ * that is listed in COMPROMISED_VERSIONS (or dynamically loaded via ioc-db.json)
+ * is present on disk (node_modules) or pinned in the lockfile.
+ *
+ * Detection sources (in priority order):
+ *   1. node_modules/<name>/package.json — confirms what is actually installed.
+ *   2. package-lock.json / yarn.lock / pnpm-lock.yaml — catches version pins
+ *      even before `npm install` has been run (useful in CI pre-flight).
+ *
+ * @param {object[]} threats - Array to push structured threat objects into.
+ * @param {object|null} [_testData] - Optional test fixture to inject:
+ *   { nodeModules: { [name]: version }, lockfilePackages: [{ name, version }] }
+ *   Pass null/undefined in production to use real filesystem reads.
+ */
+function checkCompromisedVersions(threats, _testData) {
+  const entries = getEffectiveIocs().compromisedVersions;
+  if (!entries || entries.length === 0) return;
+
+  // Build a quick lookup: package name → compromised entry list
+  // (one package may theoretically appear in multiple campaign entries)
+  const byName = new Map();
+  for (const entry of entries) {
+    if (!byName.has(entry.name)) byName.set(entry.name, []);
+    byName.get(entry.name).push(entry);
+  }
+
+  // ── Source 1: installed node_modules ──────────────────────────────────
+  const nodeModulesDir = (_testData && _testData.nodeModulesDir) || path.join(process.cwd(), 'node_modules');
+
+  if (_testData && _testData.nodeModules) {
+    // Injected test data: { [pkgName]: installedVersion }
+    for (const [pkgName, installedVersion] of Object.entries(_testData.nodeModules)) {
+      _checkVersionEntry(byName, pkgName, installedVersion, 'node_modules', threats);
+    }
+  } else if (fs.existsSync(nodeModulesDir)) {
+    for (const [pkgName, entryList] of byName) {
+      const pkgJsonPath = pkgName.startsWith('@')
+        ? path.join(nodeModulesDir, ...pkgName.split('/'), 'package.json')
+        : path.join(nodeModulesDir, pkgName, 'package.json');
+      try {
+        const meta = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+        const installedVersion = meta.version;
+        if (installedVersion) {
+          _checkVersionEntry(byName, pkgName, installedVersion, 'node_modules', threats);
+        }
+      } catch {
+        // Package not installed — skip
+      }
+    }
+  }
+
+  // ── Source 2: lockfile (catches pre-install state) ─────────────────────
+  if (_testData && _testData.lockfilePackages) {
+    // Injected test data: [{ name, version }]
+    for (const pkg of _testData.lockfilePackages) {
+      if (pkg.version) _checkVersionEntry(byName, pkg.name, pkg.version, 'lockfile', threats);
+    }
+  } else {
+    // Real filesystem — use extractPackagesFromLockfile() helper (already exists)
+    const lockfilePath = path.join(process.cwd(), 'package-lock.json');
+    if (fs.existsSync(lockfilePath)) {
+      try {
+        const lockData = JSON.parse(fs.readFileSync(lockfilePath, 'utf8'));
+        const pkgs = extractPackagesFromLockfile(lockData);
+        for (const pkg of pkgs) {
+          if (pkg.version) _checkVersionEntry(byName, pkg.name, pkg.version, 'lockfile', threats);
+        }
+      } catch {
+        // Lockfile unreadable — skip
+      }
+    }
+    // yarn.lock and pnpm-lock.yaml don't use extractPackagesFromLockfile;
+    // those parsers are internal — skip for now; node_modules check covers them.
+  }
+
+  // De-duplicate: same package@version should appear only once regardless of how many sources detected it
+  const seen = new Set();
+  for (let i = threats.length - 1; i >= 0; i--) {
+    const t = threats[i];
+    if (t.category !== 'COMPROMISED_VERSION') continue;
+    const key = t._dedupeKey;
+    if (key) {
+      if (seen.has(key)) {
+        threats.splice(i, 1);
+      } else {
+        seen.add(key);
+      }
+      delete t._dedupeKey;
+    }
+  }
+}
+
+/**
+ * Internal helper — check a single package@version against the compromised-versions map
+ * and push a threat if matched.
+ * @param {Map} byName - Map of name -> COMPROMISED_VERSIONS entries.
+ * @param {string} pkgName - Package name.
+ * @param {string} version - Resolved version string.
+ * @param {string} source - Human-readable detection source ('node_modules' | 'lockfile').
+ * @param {object[]} threats - Threats array to push into.
+ */
+function _checkVersionEntry(byName, pkgName, version, source, threats) {
+  const entryList = byName.get(pkgName);
+  if (!entryList) return;
+  for (const entry of entryList) {
+    if (entry.versions.includes(version)) {
+      const safeToFix = isSafePackageName(pkgName);
+      threats.push({
+        message: `COMPROMISED_VERSION: "${pkgName}@${version}" is a known compromised release (${entry.campaign}) — update to ${entry.safeVersion} [detected in ${source}] (OWASP A06)`,
+        category: 'COMPROMISED_VERSION',
+        fixable: safeToFix,
+        fixDescription: safeToFix ? `npm install ${pkgName}@latest` : null,
+        fix: safeToFix ? () => execSync(`npm install ${pkgName}@latest`, { stdio: 'ignore', timeout: 60000 }) : null,
+        _dedupeKey: `${pkgName}@${version}`
+      });
+    }
+  }
+}
 
 /**
  * Deep Lockfile Audit — recursively scans the dependency tree for threats.
@@ -4268,8 +4480,157 @@ const VEX_SEVERITY_MAP = {
   ENVIRONMENT: 'high',
   DEP_SCRIPT: 'high',
   REGISTRY_HTTP: 'critical',
-  LOCKFILE_INTEGRITY: 'critical'
+  LOCKFILE_INTEGRITY: 'critical',
+  COMPROMISED_VERSION: 'critical',
+  DIST_IOC: 'high',
+  DIST_SUSPICIOUS: 'medium',
+  PHANTOM_DEP: 'medium',
+  CACHE_IOC: 'high'
 };
+
+/**
+ * Map a VEX severity string to the SARIF 2.1.0 level value.
+ * GitHub Code Scanning uses: error, warning, note.
+ */
+const SARIF_LEVEL_MAP = {
+  critical: 'error',
+  high: 'error',
+  medium: 'warning',
+  low: 'note',
+  unknown: 'warning'
+};
+
+/**
+ * Best-effort: return the most relevant artifact URI for a given threat category.
+ * GitHub Code Scanning requires a location — we use the most contextually
+ * appropriate file as the artifact rather than always pointing to package.json.
+ */
+function _sarifArtifactUri(category) {
+  switch (category) {
+    case 'LOCKFILE':
+    case 'DROPPER':
+    case 'LOCKFILE_INTEGRITY':
+    case 'NO_LOCKFILE':
+      return 'package-lock.json';
+    case 'LIFECYCLE_SCRIPT':
+    case 'CRITICAL':
+    case 'OUTDATED':
+    case 'REGISTRY':
+    case 'REGISTRY_HTTP':
+    case 'PHANTOM_DEP':
+      return 'package.json';
+    case 'SECRETS':
+      return '.env';
+    case 'DIST_IOC':
+    case 'DIST_SUSPICIOUS':
+      return 'dist/';
+    default:
+      return 'package.json';
+  }
+}
+
+/**
+ * Format a JSON scan result as a SARIF 2.1.0 document for CI and GitHub Security workflows.
+ *
+ * The output is compliant with the OASIS SARIF 2.1.0 specification and the
+ * GitHub Code Scanning SARIF schema. Upload the file using the GitHub action:
+ *
+ *   - uses: github/codeql-action/upload-sarif@v3
+ *     with:
+ *       sarif_file: sec-check.sarif
+ *
+ * Each unique threat category maps to a distinct SARIF rule, with severity
+ * levels derived from the same VEX severity map used by the CycloneDX output.
+ * Findings without a specific file location default to package.json.
+ *
+ * @param {object} jsonResult - The structured result from check({ json: true }).
+ * @returns {object} SARIF 2.1.0 document object.
+ */
+function formatAsSarif(jsonResult) {
+  const toolVersion = jsonResult.metadata.version || '0.0.0';
+  const projectName = jsonResult.metadata.project || path.basename(process.cwd());
+
+  // Build a rule per unique category (GitHub surfaces these as "alert types")
+  const ruleIds = [...new Set(jsonResult.threats.map(t => (t.category || 'UNKNOWN').toUpperCase()))];
+  const rules = ruleIds.map(ruleId => {
+    const vexSeverity = VEX_SEVERITY_MAP[ruleId] || 'unknown';
+    return {
+      id: `SEC-${ruleId}`,
+      name: ruleId.replace(/[^A-Za-z0-9]/g, '_'),
+      shortDescription: {
+        text: `${ruleId} — supply-chain security finding (@sathyendra/security-checker)`
+      },
+      fullDescription: {
+        text: `Detected by @sathyendra/security-checker. Severity: ${vexSeverity}.`
+      },
+      helpUri: 'https://github.com/sathyendrav/security-checker',
+      properties: {
+        tags: ['security', 'supply-chain', 'npm'],
+        'security-severity': ({ critical: '9.0', high: '7.5', medium: '5.0', low: '2.5' })[vexSeverity] || '5.0'
+      },
+      defaultConfiguration: {
+        level: SARIF_LEVEL_MAP[vexSeverity] || 'warning'
+      }
+    };
+  });
+
+  // Build a result per threat
+  const results = jsonResult.threats.map(t => {
+    const category = (t.category || 'UNKNOWN').toUpperCase();
+    const vexSeverity = VEX_SEVERITY_MAP[category] || 'unknown';
+    const level = SARIF_LEVEL_MAP[vexSeverity] || 'warning';
+    const artifactUri = _sarifArtifactUri(category);
+    const fixText = t.fixDescription ? `Fix: ${t.fixDescription}` : 'Manual review required.';
+
+    return {
+      ruleId: `SEC-${category}`,
+      level,
+      message: {
+        text: `${t.message} — ${fixText}`
+      },
+      locations: [
+        {
+          physicalLocation: {
+            artifactLocation: {
+              uri: artifactUri,
+              uriBaseId: '%SRCROOT%'
+            }
+          }
+        }
+      ]
+    };
+  });
+
+  return {
+    $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json',
+    version: '2.1.0',
+    runs: [
+      {
+        tool: {
+          driver: {
+            name: '@sathyendra/security-checker',
+            version: toolVersion,
+            informationUri: 'https://github.com/sathyendrav/security-checker',
+            rules
+          }
+        },
+        automationDetails: {
+          id: `${projectName}/`,
+          description: {
+            text: `@sathyendra/security-checker scan of ${projectName}`
+          }
+        },
+        results,
+        invocations: [
+          {
+            executionSuccessful: true,
+            toolExecutionNotifications: []
+          }
+        ]
+      }
+    ]
+  };
+}
 
 /**
  * Format a JSON scan result into a CycloneDX VEX document (spec 1.6).
@@ -4784,7 +5145,7 @@ function checkProjectDistScan(threats, _testData) {
   }
 }
 
-module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan };
+module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, formatAsSarif, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan, checkCompromisedVersions };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow

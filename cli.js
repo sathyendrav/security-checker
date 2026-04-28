@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 // Import the main security scanning logic and IOC database utilities
-const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl } = require('./check.js');
+const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, formatAsSarif, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -42,6 +42,13 @@ Options:
   --json        Output results as machine-readable JSON instead of the human-readable
                 Diagnostic Report. Suitable for CI/CD pipelines, security dashboards,
                 and VEX (Vulnerability Exploitability eXchange) report generation.
+  --sarif       Output results as a SARIF 2.1.0 document for GitHub Code Scanning
+                and other SARIF-compatible security workflows. Pipe to a file and
+                upload via the github/codeql-action/upload-sarif action:
+                  sec-check --sarif > sec-check.sarif
+  --sarif-out <file>
+                Like --sarif but writes directly to <file> instead of stdout.
+                If the file already exists it is overwritten.
   --vex-out     Output a CycloneDX VEX document (spec 1.6) instead of the human-readable
                 Diagnostic Report. Directly consumable by OWASP Dependency-Track, Grype,
                 and other CycloneDX-compatible tools.
@@ -307,6 +314,9 @@ Exit codes:
   const fix = args.includes('--fix');
   const jsonMode = args.includes('--json');
   const vexOut = args.includes('--vex-out');
+  const sarifMode = args.includes('--sarif');
+  const sarifOutIdx = args.indexOf('--sarif-out');
+  const sarifOutFile = sarifOutIdx !== -1 ? args[sarifOutIdx + 1] : null;
   const preMode = args.includes('--pre');
   const postMode = args.includes('--post');
   const shieldMode = args.includes('--shield');
@@ -314,11 +324,14 @@ Exit codes:
   try {
     // ── Preinstall mode: lightweight lockfile + environment scan ────────
     if (preMode) {
-      const result = await preinstall({ json: jsonMode || vexOut });
+      const result = await preinstall({ json: jsonMode || vexOut || sarifMode || !!sarifOutFile });
 
       if (vexOut) {
         const vexDoc = formatAsVex(result);
         console.log(JSON.stringify(vexDoc, null, 2));
+        process.exit(result.summary.clean ? 0 : 1);
+      } else if (sarifMode || sarifOutFile) {
+        _outputSarif(result, sarifOutFile);
         process.exit(result.summary.clean ? 0 : 1);
       } else if (jsonMode) {
         console.log(JSON.stringify(result, null, 2));
@@ -331,11 +344,14 @@ Exit codes:
 
     // ── Post-install vetting mode ──────────────────────────────────────
     if (postMode) {
-      const result = await postVet({ fix, json: jsonMode || vexOut });
+      const result = await postVet({ fix, json: jsonMode || vexOut || sarifMode || !!sarifOutFile });
 
       if (vexOut) {
         const vexDoc = formatAsVex(result);
         console.log(JSON.stringify(vexDoc, null, 2));
+        process.exit(result.summary.clean ? 0 : 1);
+      } else if (sarifMode || sarifOutFile) {
+        _outputSarif(result, sarifOutFile);
         process.exit(result.summary.clean ? 0 : 1);
       } else if (jsonMode) {
         console.log(JSON.stringify(result, null, 2));
@@ -348,11 +364,14 @@ Exit codes:
 
     // ── Shield mode: three-stage Zero Trust workflow ─────────────────────
     if (shieldMode) {
-      const result = await shield({ fix, json: jsonMode || vexOut });
+      const result = await shield({ fix, json: jsonMode || vexOut || sarifMode || !!sarifOutFile });
 
       if (vexOut) {
         const vexDoc = formatAsVex(result);
         console.log(JSON.stringify(vexDoc, null, 2));
+        process.exit(result.summary.clean ? 0 : 1);
+      } else if (sarifMode || sarifOutFile) {
+        _outputSarif(result, sarifOutFile);
         process.exit(result.summary.clean ? 0 : 1);
       } else if (jsonMode) {
         console.log(JSON.stringify(result, null, 2));
@@ -363,15 +382,19 @@ Exit codes:
       return;
     }
 
-    // --vex-out implies JSON mode internally (needs the structured result object).
-    // In default mode the Diagnostic Report is printed first; in JSON/VEX mode it is suppressed.
+    // --vex-out / --sarif imply JSON mode internally (need the structured result object).
+    // In default mode the Diagnostic Report is printed first; in JSON/VEX/SARIF mode it is suppressed.
     // When --fix is passed, fixable threats are auto-remediated after the report.
-    const result = await check({ fix, json: jsonMode || vexOut });
+    const result = await check({ fix, json: jsonMode || vexOut || sarifMode || !!sarifOutFile });
 
     if (vexOut) {
       // CycloneDX VEX document — directly consumable by Dependency-Track, Grype, etc.
       const vexDoc = formatAsVex(result);
       console.log(JSON.stringify(vexDoc, null, 2));
+      process.exit(result.summary.clean ? 0 : 1);
+    } else if (sarifMode || sarifOutFile) {
+      // SARIF 2.1.0 — for GitHub Code Scanning and SARIF-compatible CI tools.
+      _outputSarif(result, sarifOutFile);
       process.exit(result.summary.clean ? 0 : 1);
     } else if (jsonMode) {
       // Machine-readable output to stdout — suitable for piping to dashboards / VEX generators
@@ -385,6 +408,29 @@ Exit codes:
     // Handle unexpected errors gracefully
     console.error('❌ Security check failed:', err.message);
     process.exit(1);
+  }
+}
+
+/**
+ * Render a JSON scan result as SARIF 2.1.0 and either print to stdout or
+ * write to a file (when sarifOutFile is provided).
+ *
+ * @param {object} result - Structured scan result from check({ json: true }).
+ * @param {string|null} sarifOutFile - Destination file path, or null for stdout.
+ */
+function _outputSarif(result, sarifOutFile) {
+  const sarifDoc = formatAsSarif(result);
+  const sarifJson = JSON.stringify(sarifDoc, null, 2);
+  if (sarifOutFile) {
+    try {
+      fs.writeFileSync(path.resolve(sarifOutFile), sarifJson, 'utf8');
+      console.error(`✅ SARIF report written to ${sarifOutFile}`);
+    } catch (err) {
+      console.error(`❌ Failed to write SARIF file: ${err.message}`);
+      process.exit(1);
+    }
+  } else {
+    console.log(sarifJson);
   }
 }
 

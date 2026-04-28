@@ -1,4 +1,14 @@
 {
+  "_meta": {
+    "description": "IOC (Indicators of Compromise) database for @sathyendra/security-checker.",
+    "signing": "This file is Ed25519-signed. After ANY modification re-sign with: node scripts/sign-ioc-db.js",
+    "fields": {
+      "c2Domains": "Known command-and-control domains used by malware to exfiltrate data or receive instructions.",
+      "maliciousNpmPackages": "npm packages confirmed to be malicious or supply-chain-compromised. Name-only detection — the entire package is flagged regardless of version.",
+      "maliciousPypiPackages": "PyPI packages confirmed to be malicious or supply-chain-compromised. Name-only detection.",
+      "compromisedVersions": "Version-scoped entries — only specific version ranges are flagged. Use when earlier/later releases of a package are safe (e.g. a hijacked patch release). Each entry: { name, versions[], safeVersion, campaign, ref }."
+    }
+  },
   "c2Domains": [
     "sfrclak.com",
     "cfrclak.com",
@@ -37,8 +47,7 @@
     "hardhta",
     "naniod",
     "secp256",
-    "crypto-locale",
-    "pgserve"
+    "crypto-locale"
   ],
   "maliciousPypiPackages": [
     "litellm-proxy",
@@ -49,5 +58,6 @@
     "kics-scanner",
     "aqua-trivy",
     "litellm-internal"
-  ]
+  ],
+  "compromisedVersions": []
 }
