@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 // Import the main security scanning logic and IOC database utilities
-const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, formatAsSarif, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, loadPolicy, applySuppressions, CHECK_NAMES, discoverWorkspaces, scanWorkspaces } = require('./check.js');
+const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, formatAsSarif, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, loadPolicy, applySuppressions, CHECK_NAMES, discoverWorkspaces, scanWorkspaces, loadBaseline, saveBaseline, diffAgainstBaseline, BASELINE_FILE, checkIocFreshness, updateIocDbIfStale } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -84,6 +84,11 @@ Options:
                 ${getDbPath()}
                 and merged with the built-in lists on every scan.
                 Override the source URL with SEC_CHECK_IOC_URL env variable.
+  --update-if-stale
+                Update the IOC cache only if it is missing or stale.
+                Exit code 0 = already fresh or updated successfully; 1 = update failed.
+  --ioc-age     Report the age of the local IOC cache and exit.
+                Exit code 0 = ok/warn/unknown/never; 1 = critical (>= 30 days old).
   --add-ioc <type> <value>
                 Add a project-local IOC to .sec-check-ioc.json.
                 <type> must be one of: c2, npm, pypi
@@ -114,6 +119,17 @@ Options:
                 Combine with --json for machine-readable per-package results.
                 Combine with --fix to auto-remediate fixable threats.
                 Exit code 1 if any workspace package has threats.
+  --save-baseline
+                Capture the current scan findings as the accepted baseline.
+                Writes .sec-check-baseline.json in the project directory.
+                Run this once to record known/accepted debt, then commit the
+                file so CI can use --baseline on subsequent runs.
+                Exit code is always 0 after saving.
+  --baseline    Diff mode: compare scan results against the saved baseline
+                (.sec-check-baseline.json). Only NEW threats (not present in
+                the baseline) cause a non-zero exit code. Pre-existing accepted
+                findings are reported informationally but do not fail CI.
+                Combine with --json for machine-readable new/existing counts.
   --help        Show this help message.
 
 Exit codes:
@@ -141,6 +157,36 @@ Exit codes:
       console.error(`❌ Update failed: ${result.message}`);
       process.exit(1);
     }
+  }
+
+  // Handle --update-if-stale: refresh IOC cache when missing/stale and exit
+  if (args.includes('--update-if-stale')) {
+    const result = await updateIocDbIfStale();
+
+    // If we didn't update, just report freshness.
+    if (!result.updateAttempted) {
+      const icon = result.freshnessAfter.status === 'ok' ? '✅' : result.freshnessAfter.status === 'warn' ? '⚠️ ' : '🚨';
+      console.log(`${icon} ${result.freshnessAfter.message}`);
+      process.exit(0);
+    }
+
+    if (result.updateOk) {
+      console.log(`✅ ${result.updateMessage || 'IOC cache updated'}`);
+      console.log(`   ${result.freshnessAfter.message}`);
+      process.exit(0);
+    }
+
+    console.error(`❌ Update failed: ${result.updateMessage || 'unknown error'}`);
+    console.error(`   ${result.freshnessAfter.message}`);
+    process.exit(1);
+  }
+
+  // Handle --ioc-age: report the age of the local IOC cache and exit
+  if (args.includes('--ioc-age')) {
+    const freshness = checkIocFreshness();
+    const icon = freshness.status === 'ok' ? '✅' : freshness.status === 'warn' ? '⚠️ ' : '🚨';
+    console.log(`${icon} ${freshness.message}`);
+    process.exit(freshness.status === 'critical' ? 1 : 0);
   }
 
   // Handle --approve <pkg>: add a package to the approved list
@@ -402,6 +448,25 @@ Exit codes:
   const sarifMode = args.includes('--sarif');
   const sarifOutIdx = args.indexOf('--sarif-out');
   const sarifOutFile = sarifOutIdx !== -1 ? args[sarifOutIdx + 1] : null;
+  const saveBaselineMode = args.includes('--save-baseline');
+  const baselineMode = args.includes('--baseline');
+
+  // Handle --save-baseline: run scan, save findings as baseline, exit 0
+  if (saveBaselineMode) {
+    const result = await check({ json: true });
+    const bPath = saveBaseline(result.threats || [], process.cwd());
+    if (jsonMode) {
+      console.log(JSON.stringify({
+        baselineSaved: (result.threats || []).length,
+        baselineFile: bPath,
+        timestamp: new Date().toISOString()
+      }, null, 2));
+    } else {
+      console.log(`✅ Baseline saved: ${(result.threats || []).length} threat(s) recorded in ${BASELINE_FILE}`);
+    }
+    process.exit(0);
+    return;
+  }
 
   // Handle --workspaces: discover and scan all workspace packages
   if (args.includes('--workspaces')) {
@@ -484,7 +549,7 @@ Exit codes:
     // --vex-out / --sarif imply JSON mode internally (need the structured result object).
     // In default mode the Diagnostic Report is printed first; in JSON/VEX/SARIF mode it is suppressed.
     // When --fix is passed, fixable threats are auto-remediated after the report.
-    const result = await check({ fix, json: jsonMode || vexOut || sarifMode || !!sarifOutFile });
+    const result = await check({ fix, json: jsonMode || vexOut || sarifMode || !!sarifOutFile, baseline: baselineMode });
 
     if (vexOut) {
       // CycloneDX VEX document — directly consumable by Dependency-Track, Grype, etc.
@@ -500,7 +565,8 @@ Exit codes:
       console.log(JSON.stringify(result, null, 2));
       process.exit(result.summary.clean ? 0 : 1);
     } else {
-      // Exit with code 1 if threats were found, 0 if clean
+      // Exit with code 1 if threats were found, 0 if clean.
+      // In baseline mode, check() returns true only for NEW threats (not baselined).
       process.exit(result ? 1 : 0);
     }
   } catch (err) {

@@ -1,6 +1,6 @@
 # @sathyendra/security-checker
 
-> **Stop supply-chain attacks before they execute.** One command. Zero dependencies. 18 security checks.
+> **Stop supply-chain attacks before they execute.** One command. Zero dependencies. Comprehensive security checks.
 
 ## Table of Contents
 
@@ -49,7 +49,7 @@ Traditional tools (`npm audit`) only check for *known CVEs*. They miss:
 npx @sathyendra/security-checker
 ```
 
-**That's it.** One command scans your entire project for 18 categories of supply-chain threats — before any malicious code can execute.
+**That's it.** One command scans your entire project for a broad range of supply-chain threats — before any malicious code can execute.
 
 ### Before vs After
 

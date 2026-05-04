@@ -50,6 +50,12 @@ const PROJECT_IOC_FILE = '.sec-check-ioc.json';
  *   suppressions {Array}   List of suppression rules (see loadPolicy docs).
  */
 const POLICY_FILE = '.sec-check-policy.json';
+const BASELINE_FILE = '.sec-check-baseline.json';
+
+/** Age threshold (days) at which the IOC cache triggers a warning. */
+const IOC_WARN_DAYS = 7;
+/** Age threshold (days) at which the IOC cache triggers a critical staleness warning. */
+const IOC_CRITICAL_DAYS = 30;
 
 /**
  * Canonical check names used in policy.checks toggles and suppression rules.
@@ -128,6 +134,128 @@ function loadIocDb() {
   } catch {
     return null;
   }
+}
+
+/**
+ * Check the freshness of the local IOC cache.
+ *
+ * Compares the `updatedAt` timestamp in the cached ioc-db.json against two
+ * configurable age thresholds:
+ *   - warn:     >= IOC_WARN_DAYS (default 7 days)  — the cache is getting stale
+ *   - critical: >= IOC_CRITICAL_DAYS (default 30 days) — the cache is very stale
+ *
+ * When no cache exists (the user has never run `--update-db`), status is 'never'.
+ * When `updatedAt` is absent or unparseable, status is 'unknown'.
+ *
+ * @param {{ warnDays?: number, criticalDays?: number }} [opts]
+ * @returns {{
+ *   status: 'ok' | 'warn' | 'critical' | 'never' | 'unknown',
+ *   ageDays: number | null,
+ *   updatedAt: string | null,
+ *   message: string
+ * }}
+ */
+function checkIocFreshness(opts = {}) {
+  const warnDays = (typeof opts.warnDays === 'number' && opts.warnDays > 0) ? opts.warnDays : IOC_WARN_DAYS;
+  const criticalDays = (typeof opts.criticalDays === 'number' && opts.criticalDays > 0) ? opts.criticalDays : IOC_CRITICAL_DAYS;
+
+  const db = loadIocDb();
+
+  if (!db) {
+    return {
+      status: 'never',
+      ageDays: null,
+      updatedAt: null,
+      message: `IOC cache has never been updated — run 'sec-check --update-db' to fetch the latest indicators`
+    };
+  }
+
+  if (!db.updatedAt || typeof db.updatedAt !== 'string') {
+    return {
+      status: 'unknown',
+      ageDays: null,
+      updatedAt: null,
+      message: `IOC cache has no timestamp — run 'sec-check --update-db' to refresh`
+    };
+  }
+
+  const updatedMs = Date.parse(db.updatedAt);
+  if (!Number.isFinite(updatedMs)) {
+    return {
+      status: 'unknown',
+      ageDays: null,
+      updatedAt: db.updatedAt,
+      message: `IOC cache timestamp is invalid ('${db.updatedAt}') — run 'sec-check --update-db' to refresh`
+    };
+  }
+
+  const ageDays = (Date.now() - updatedMs) / (1000 * 60 * 60 * 24);
+  const ageDaysRounded = Math.floor(ageDays);
+
+  if (ageDays >= criticalDays) {
+    return {
+      status: 'critical',
+      ageDays: ageDaysRounded,
+      updatedAt: db.updatedAt,
+      message: `IOC cache is ${ageDaysRounded} day(s) old (critical threshold: ${criticalDays} days) — run 'sec-check --update-db' immediately`
+    };
+  }
+
+  if (ageDays >= warnDays) {
+    return {
+      status: 'warn',
+      ageDays: ageDaysRounded,
+      updatedAt: db.updatedAt,
+      message: `IOC cache is ${ageDaysRounded} day(s) old (warn threshold: ${warnDays} days) — run 'sec-check --update-db' to refresh`
+    };
+  }
+
+  return {
+    status: 'ok',
+    ageDays: ageDaysRounded,
+    updatedAt: db.updatedAt,
+    message: `IOC cache is up to date (${ageDaysRounded} day(s) old)`
+  };
+}
+
+/**
+ * Update the local IOC cache if it is stale (warn/critical) or missing.
+ *
+ * This function is opt-in because it performs a network request.
+ *
+ * @param {{ warnDays?: number, criticalDays?: number }} [opts]
+ * @returns {Promise<{
+ *   freshnessBefore: ReturnType<typeof checkIocFreshness>,
+ *   freshnessAfter: ReturnType<typeof checkIocFreshness>,
+ *   updateAttempted: boolean,
+ *   updateOk: boolean | null,
+ *   updateMessage: string | null
+ * }>}
+ */
+async function updateIocDbIfStale(opts = {}) {
+  const freshnessBefore = checkIocFreshness(opts);
+
+  const shouldUpdate = freshnessBefore.status !== 'ok';
+  if (!shouldUpdate) {
+    return {
+      freshnessBefore,
+      freshnessAfter: freshnessBefore,
+      updateAttempted: false,
+      updateOk: null,
+      updateMessage: null
+    };
+  }
+
+  const result = await updateDb();
+  const freshnessAfter = checkIocFreshness(opts);
+
+  return {
+    freshnessBefore,
+    freshnessAfter,
+    updateAttempted: true,
+    updateOk: !!result.ok,
+    updateMessage: typeof result.message === 'string' ? result.message : null
+  };
 }
 
 /**
@@ -683,6 +811,80 @@ function getEffectiveIocs() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Baseline / Diff Mode — .sec-check-baseline.json
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Compute a stable fingerprint for a threat.
+ * Used to match threats across runs for baseline comparison.
+ * The fingerprint is the combination of category + the full message.
+ *
+ * @param {{ message: string, category: string }} threat
+ * @returns {string}
+ */
+function _threatFingerprint(threat) {
+  return `${threat.category || ''}::${threat.message || ''}`;
+}
+
+/**
+ * Load the baseline file from disk.
+ * Returns an empty object (no fingerprints) when the file is absent or invalid.
+ *
+ * @param {string} [projectDir] - Project directory (defaults to cwd).
+ * @returns {{ version: number, fingerprints: string[], savedAt: string }}
+ */
+function loadBaseline(projectDir) {
+  const dir = projectDir || process.cwd();
+  const filePath = path.join(dir, BASELINE_FILE);
+  try {
+    const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (raw && Array.isArray(raw.fingerprints)) return raw;
+  } catch { /* absent or malformed — treated as empty */ }
+  return { version: 1, fingerprints: [], savedAt: null };
+}
+
+/**
+ * Save the current set of visible threats as the new baseline.
+ * Writes .sec-check-baseline.json to the project directory.
+ *
+ * @param {Array<{ message: string, category: string }>} threats
+ * @param {string} [projectDir] - Project directory (defaults to cwd).
+ * @returns {string} Absolute path to the written baseline file.
+ */
+function saveBaseline(threats, projectDir) {
+  const dir = projectDir || process.cwd();
+  const filePath = path.join(dir, BASELINE_FILE);
+  const data = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    fingerprints: threats.map(_threatFingerprint)
+  };
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  return filePath;
+}
+
+/**
+ * Partition threats into new (not in baseline) and existing (already baselined).
+ *
+ * @param {Array} threats - Current visible threats.
+ * @param {{ fingerprints: string[] }} baseline - Loaded baseline object.
+ * @returns {{ newThreats: Array, existingThreats: Array }}
+ */
+function diffAgainstBaseline(threats, baseline) {
+  const baselineSet = new Set(baseline.fingerprints || []);
+  const newThreats = [];
+  const existingThreats = [];
+  for (const t of threats) {
+    if (baselineSet.has(_threatFingerprint(t))) {
+      existingThreats.push(t);
+    } else {
+      newThreats.push(t);
+    }
+  }
+  return { newThreats, existingThreats };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Policy Engine — .sec-check-policy.json
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1212,6 +1414,38 @@ async function check(options = {}) {
     console.warn('⚠️  Running without admin/root — RAT artifact scans may miss indicators');
   }
 
+  // IOC cache freshness check — warn when the local database is stale.
+  // This runs before any detection logic so the user sees the warning
+  // regardless of which threats are found.
+  let iocFreshness = checkIocFreshness();
+  let iocUpdate = null;
+
+  // Optional: auto-refresh the IOC cache when stale/missing.
+  // Disabled by default to avoid surprise network access.
+  const autoUpdateIocs = options.updateDbIfStale === true || process.env.SEC_CHECK_UPDATE_DB_IF_STALE === '1';
+  if (autoUpdateIocs && iocFreshness.status !== 'ok') {
+    iocUpdate = await updateIocDbIfStale();
+    iocFreshness = iocUpdate.freshnessAfter;
+  }
+
+  if (!jsonMode) {
+    if (iocUpdate && iocUpdate.updateAttempted) {
+      if (iocUpdate.updateOk) {
+        console.log(`✅ IOC cache refreshed: ${iocUpdate.updateMessage}`);
+      } else {
+        console.warn(`❌ IOC cache refresh failed: ${iocUpdate.updateMessage || 'unknown error'}`);
+      }
+    }
+
+    if (iocFreshness.status === 'critical') {
+      console.warn(`🚨 ${iocFreshness.message}`);
+    } else if (iocFreshness.status === 'warn') {
+      console.warn(`⚠️  ${iocFreshness.message}`);
+    } else if (iocFreshness.status === 'never') {
+      console.warn(`⚠️  ${iocFreshness.message}`);
+    }
+  }
+
   // 1. Known malicious package detection
   //    plain-crypto-js is a supply-chain attack package that mimics crypto-js.
   //    If present in node_modules, the project is compromised.
@@ -1518,19 +1752,63 @@ async function check(options = {}) {
   const visibleThreats = applySuppressions(threats, policy.suppressions);
   const suppressedCount = activeThreatCount - visibleThreats.length;
 
+  // ── Baseline / Diff Mode ───────────────────────────────────────────────
+  // When --save-baseline is set, persist current findings and exit clean.
+  // When --baseline is set, only new threats (not in baseline) fail the run.
+  const baselineDir = options._policyDir || process.cwd();
+  const doSaveBaseline = options.saveBaseline;
+  const doBaseline = options.baseline;
+
+  if (doSaveBaseline) {
+    const bPath = saveBaseline(visibleThreats, baselineDir);
+    if (!jsonMode) {
+      console.log(`✅ Baseline saved: ${visibleThreats.length} threat(s) recorded in ${path.basename(bPath)}`);
+    }
+    if (jsonMode) {
+      return {
+        threats: [],
+        summary: { total: 0, fixable: 0, manual: 0, suppressed: suppressedCount, clean: true, baselineSaved: visibleThreats.length },
+        metadata: {
+          tool: '@sathyendra/security-checker',
+          version: require('./package.json').version,
+          timestamp: new Date().toISOString(),
+          baselineFile: BASELINE_FILE
+        }
+      };
+    }
+    return false; // exit 0 — baseline saved, no CI failure
+  }
+
+  // Partition into new vs existing when --baseline is active
+  let newThreats = visibleThreats;
+  let existingThreats = [];
+  let baselineUsed = false;
+  if (doBaseline) {
+    const baseline = loadBaseline(baselineDir);
+    const diff = diffAgainstBaseline(visibleThreats, baseline);
+    newThreats = diff.newThreats;
+    existingThreats = diff.existingThreats;
+    baselineUsed = true;
+  }
+
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
   if (!jsonMode) {
-    printDiagnosticReport(visibleThreats, fix);
+    // In baseline mode, only report new threats as failing
+    printDiagnosticReport(baselineUsed ? newThreats : visibleThreats, fix);
     if (suppressedCount > 0) {
       console.log(`ℹ️  ${suppressedCount} threat(s) suppressed by ${POLICY_FILE}`);
+    }
+    if (baselineUsed && existingThreats.length > 0) {
+      console.log(`ℹ️  ${existingThreats.length} accepted baseline threat(s) ignored (run --save-baseline to update)`);
     }
   }
 
   // ── Auto-remediation (only when --fix is passed) ───────────────────────
   // The tool is read-only by default. Fixes are opt-in and non-destructive.
-  if (fix && visibleThreats.some(t => t.fixable)) {
-    await runFixes(visibleThreats);
+  const threatsForFix = baselineUsed ? newThreats : visibleThreats;
+  if (fix && threatsForFix.some(t => t.fixable)) {
+    await runFixes(threatsForFix);
   }
 
   // ── JSON mode: return structured result object ─────────────────────────
@@ -1540,9 +1818,10 @@ async function check(options = {}) {
         return JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
       } catch { return {}; }
     })();
-    const fixableCount = visibleThreats.filter(t => t.fixable).length;
-    return {
-      threats: visibleThreats.map(t => ({
+    const reportThreats = baselineUsed ? newThreats : visibleThreats;
+    const fixableCount = reportThreats.filter(t => t.fixable).length;
+    const result = {
+      threats: reportThreats.map(t => ({
         message: t.message,
         category: t.category,
         check: t._check || null,
@@ -1550,11 +1829,11 @@ async function check(options = {}) {
         fixDescription: t.fixDescription || null
       })),
       summary: {
-        total: visibleThreats.length,
+        total: reportThreats.length,
         fixable: fixableCount,
-        manual: visibleThreats.length - fixableCount,
+        manual: reportThreats.length - fixableCount,
         suppressed: suppressedCount,
-        clean: visibleThreats.length === 0
+        clean: reportThreats.length === 0
       },
       metadata: {
         tool: '@sathyendra/security-checker',
@@ -1563,12 +1842,28 @@ async function check(options = {}) {
         project: pkg.name || path.basename(process.cwd()),
         platform: sys,
         node: process.version,
-        policyFile: suppressedCount > 0 || Object.keys(policy.checks).length > 0 ? POLICY_FILE : null
+        policyFile: suppressedCount > 0 || Object.keys(policy.checks).length > 0 ? POLICY_FILE : null,
+        iocCache: {
+          status: iocFreshness.status,
+          ageDays: iocFreshness.ageDays,
+          updatedAt: iocFreshness.updatedAt,
+          updateAttempted: !!(iocUpdate && iocUpdate.updateAttempted),
+          updateOk: (iocUpdate && iocUpdate.updateAttempted) ? iocUpdate.updateOk : null,
+          updateMessage: (iocUpdate && iocUpdate.updateAttempted) ? iocUpdate.updateMessage : null
+        }
       }
     };
+    if (baselineUsed) {
+      result.summary.newThreats = newThreats.length;
+      result.summary.existingThreats = existingThreats.length;
+      result.metadata.baselineFile = BASELINE_FILE;
+    }
+    return result;
   }
 
-  return visibleThreats.length > 0;
+  // In baseline mode: only fail if there are NEW threats
+  const failingThreats = baselineUsed ? newThreats : visibleThreats;
+  return failingThreats.length > 0;
 }
 
 /**
@@ -4987,13 +5282,251 @@ function lockfileSentinel(threats, _testData) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Generate a CycloneDX SBOM (spec 1.6) from the project's package-lock.json.
+ * Parse a Yarn v1 lockfile (classic format, starts with "# yarn lockfile v1").
+ * Extracts name, version, and npm-style integrity hash for each package block.
  *
- * Produces a machine-readable inventory of every dependency (direct and
- * transitive) in the project. Each component includes name, version, purl
- * (Package URL), and scope. The SBOM can be fed into OWASP Dependency-Track,
- * Grype, or any CycloneDX-compatible tool for continuous supply-chain
- * monitoring.
+ * @param {string} content - Raw content of yarn.lock.
+ * @returns {{ name: string, version: string|null, integrity: string|null }[]}
+ */
+function parseYarnV1Lock(content) {
+  const packages = [];
+  const lines = content.split('\n');
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // Skip comments, blank lines
+    if (!trimmed || trimmed.startsWith('#')) { i++; continue; }
+
+    // Block header: not indented, ends with ':'
+    // Examples: "lodash@^4.17.21:" or "@babel/core@^7.0.0, @babel/core@^7.1.0:"
+    if (!line.startsWith(' ') && !line.startsWith('\t') && trimmed.endsWith(':')) {
+      const specifiersRaw = trimmed.slice(0, -1); // remove trailing ':'
+      // Extract name from the first specifier
+      const firstSpec = specifiersRaw.split(',')[0].trim().replace(/^["']|["']$/g, '');
+      // Handle scoped (@scope/pkg@range) and plain (pkg@range) specifiers
+      const nameMatch = /^(@[^@]+\/[^@]+|[^@]+)@/.exec(firstSpec);
+      const pkgName = nameMatch ? nameMatch[1] : null;
+
+      let version = null;
+      let integrity = null;
+
+      i++;
+      while (i < lines.length) {
+        const blockLine = lines[i];
+        // End of block: non-empty, non-indented line
+        if (blockLine.length > 0 && !blockLine.startsWith(' ') && !blockLine.startsWith('\t')) break;
+
+        const blockTrimmed = blockLine.trim();
+        // Only read top-level properties of this block (2 spaces, not 4+)
+        if (blockLine.startsWith('  ') && !blockLine.startsWith('    ')) {
+          const vm = /^version "(.+)"$/.exec(blockTrimmed);
+          if (vm) version = vm[1];
+          const im = /^integrity (.+)$/.exec(blockTrimmed);
+          if (im) integrity = im[1].trim();
+        }
+        i++;
+      }
+
+      if (pkgName && version) {
+        packages.push({ name: pkgName, version, integrity });
+      }
+    } else {
+      i++;
+    }
+  }
+
+  return packages;
+}
+
+/**
+ * Parse a Yarn Berry (v2+) lockfile.
+ * Berry lockfiles contain "__metadata:" and use YAML-like syntax.
+ * Entries with "linkType: soft" (workspace packages) are excluded.
+ *
+ * @param {string} content - Raw content of yarn.lock.
+ * @returns {{ name: string, version: string|null, integrity: string|null }[]}
+ */
+function parseYarnBerryLock(content) {
+  const packages = [];
+  const lines = content.split('\n');
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (!trimmed || trimmed.startsWith('#')) { i++; continue; }
+
+    // Block header: not indented, ends with ':'
+    if (!line.startsWith(' ') && !line.startsWith('\t') && trimmed.endsWith(':')) {
+      // Skip __metadata block (Berry version info, not a package entry)
+      if (trimmed === '__metadata:') {
+        i++;
+        while (i < lines.length && (lines[i].startsWith(' ') || lines[i].startsWith('\t') || !lines[i].trim())) i++;
+        continue;
+      }
+
+      // Berry specifier format: "name@protocol:version-range":
+      // e.g. "commander@npm:^10.0.1": or "@babel/core@npm:^7.0.0":
+      const specRaw = trimmed.slice(0, -1).replace(/^["']|["']$/g, '');
+      // Extract name as everything before @<protocol>: pattern
+      const protoMatch = /^(@[^@]+\/[^@]+|[^@]+)@[a-z]+:/.exec(specRaw);
+      const pkgName = protoMatch ? protoMatch[1] : null;
+
+      let version = null;
+      let integrity = null;
+      let linkType = null;
+
+      i++;
+      while (i < lines.length) {
+        const blockLine = lines[i];
+        if (blockLine.length > 0 && !blockLine.startsWith(' ') && !blockLine.startsWith('\t')) break;
+
+        const blockTrimmed = blockLine.trim();
+        const versionM = /^version: (.+)$/.exec(blockTrimmed);
+        if (versionM) version = versionM[1].replace(/^["']|["']$/g, '');
+
+        const linkM = /^linkType: (.+)$/.exec(blockTrimmed);
+        if (linkM) linkType = linkM[1].trim();
+
+        // Berry checksum — only use standard sha512-<base64> format (same as npm)
+        // Berry v3+ uses "<cacheKey>/<hexHash>" format which is a different algorithm;
+        // skip those to avoid misrepresenting hashes in the SBOM.
+        const checksumM = /^checksum: (.+)$/.exec(blockTrimmed);
+        if (checksumM) {
+          const raw = checksumM[1].trim();
+          if (raw.startsWith('sha512-')) integrity = raw;
+        }
+
+        i++;
+      }
+
+      // Skip workspace entries (soft-linked local packages)
+      if (linkType === 'soft') continue;
+
+      if (pkgName && version) {
+        packages.push({ name: pkgName, version, integrity });
+      }
+    } else {
+      i++;
+    }
+  }
+
+  return packages;
+}
+
+/**
+ * Parse a pnpm-lock.yaml (v5/v6/v9) lockfile.
+ * Extracts package name, version, and integrity from the packages: section.
+ * Implemented without any YAML library using line-by-line analysis.
+ *
+ * @param {string} content - Raw content of pnpm-lock.yaml.
+ * @returns {{ name: string, version: string|null, integrity: string|null }[]}
+ */
+function parsePnpmLock(content) {
+  const packages = [];
+  const seen = new Set();
+  const lines = content.split('\n');
+  let inPackages = false;
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (!trimmed || trimmed.startsWith('#')) { i++; continue; }
+
+    // Detect top-level section boundaries (non-indented keys)
+    if (!line.startsWith(' ') && !line.startsWith('\t') && trimmed.endsWith(':')) {
+      inPackages = /^packages\s*:/.test(trimmed);
+      i++;
+      continue;
+    }
+
+    // Outside the packages section — skip
+    if (!inPackages) { i++; continue; }
+
+    // Package entry key: exactly 2 spaces of indentation, ends with ':'
+    // e.g. "  /lodash/4.17.21:" (v5) or "  /lodash@4.17.21:" (v6) or "  lodash@4.17.21:" (v9)
+    if (/^  [^\s]/.test(line) && trimmed.endsWith(':')) {
+      const rawKey = trimmed.slice(0, -1).replace(/^['"]|['"]$/g, '');
+      const parsed = _parsePnpmPackageKey(rawKey);
+
+      if (!parsed) { i++; continue; }
+
+      let integrity = null;
+      i++;
+      while (i < lines.length) {
+        const blockLine = lines[i];
+        // End of this entry when indentation returns to <= 2 spaces with content
+        if (blockLine.trim() && !/^    /.test(blockLine)) break;
+        // Extract integrity from resolution block: {integrity: sha512-...}
+        const integrityM = /integrity:\s*(sha\d+-[A-Za-z0-9+/=]+)/.exec(blockLine);
+        if (integrityM) integrity = integrityM[1];
+        i++;
+      }
+
+      const dedupeKey = `${parsed.name}@${parsed.version}`;
+      if (!seen.has(dedupeKey)) {
+        seen.add(dedupeKey);
+        packages.push({ name: parsed.name, version: parsed.version, integrity });
+      }
+      continue;
+    }
+
+    i++;
+  }
+
+  return packages;
+}
+
+/**
+ * Parse a pnpm lockfile package key to extract name and version.
+ * Handles v5 (slash-separated), v6 (/@name@version), and v9 (name@version) formats.
+ *
+ * @param {string} rawKey - Trimmed key without surrounding quotes or trailing colon.
+ * @returns {{ name: string, version: string }|null}
+ */
+function _parsePnpmPackageKey(rawKey) {
+  let s = rawKey.trim();
+  if (s.startsWith('/')) s = s.slice(1); // strip leading / (v5/v6)
+
+  // Try last @ first — covers v6 (/name@ver) and v9 (name@ver)
+  const atIdx = s.lastIndexOf('@');
+  if (atIdx > 0) {
+    const maybeName = s.slice(0, atIdx);
+    // Strip peer-dep suffixes: 1.2.3_peer@1.0.0 → 1.2.3 or 1.2.3(peer@1.0.0) → 1.2.3
+    const maybeVersion = s.slice(atIdx + 1).split('_')[0].split('(')[0];
+    if (/^\d+\.\d+/.test(maybeVersion)) {
+      return { name: maybeName, version: maybeVersion };
+    }
+  }
+
+  // Fallback: last / (v5 format: name/version)
+  const slashIdx = s.lastIndexOf('/');
+  if (slashIdx > 0) {
+    const maybeName = s.slice(0, slashIdx);
+    const maybeVersion = s.slice(slashIdx + 1).split('_')[0].split('(')[0];
+    if (/^\d+\.\d+/.test(maybeVersion)) {
+      return { name: maybeName, version: maybeVersion };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Generate a CycloneDX SBOM (spec 1.6) from the project's lockfile.
+ *
+ * Auto-detects the lockfile in priority order: package-lock.json (npm) →
+ * yarn.lock (Yarn v1 or Berry) → pnpm-lock.yaml (pnpm). Produces a
+ * machine-readable inventory of every dependency (direct and transitive)
+ * in the project. Each component includes name, version, purl (Package URL),
+ * and scope. The SBOM can be fed into OWASP Dependency-Track, Grype, or any
+ * CycloneDX-compatible tool for continuous supply-chain monitoring.
  *
  * @returns {object} CycloneDX SBOM document object, or an object with an error property.
  */
@@ -5012,26 +5545,47 @@ function generateSbom() {
   const projectName = rootPkg.name || path.basename(cwd);
   const projectVersion = rootPkg.version || '0.0.0';
 
-  // Read package-lock.json for the full dependency tree
-  let lockData;
-  try {
-    lockData = JSON.parse(fs.readFileSync(path.join(cwd, 'package-lock.json'), 'utf8'));
-  } catch {
-    return { error: 'No package-lock.json found — run npm install first' };
-  }
-
   // Determine direct dependencies for scope classification
-  const directDeps = new Set();
-  if (rootPkg.dependencies) {
-    for (const name of Object.keys(rootPkg.dependencies)) directDeps.add(name);
-  }
-  const directDevDeps = new Set();
-  if (rootPkg.devDependencies) {
-    for (const name of Object.keys(rootPkg.devDependencies)) directDevDeps.add(name);
+  const directDeps = new Set(Object.keys(rootPkg.dependencies || {}));
+  const directDevDeps = new Set(Object.keys(rootPkg.devDependencies || {}));
+
+  // Auto-detect lockfile: npm → Yarn → pnpm
+  let packages = null;
+  let lockfileUsed = null;
+
+  // 1. package-lock.json (npm)
+  try {
+    const lockData = JSON.parse(fs.readFileSync(path.join(cwd, 'package-lock.json'), 'utf8'));
+    packages = extractPackagesFromLockfile(lockData);
+    lockfileUsed = 'package-lock.json';
+  } catch { /* fall through */ }
+
+  // 2. yarn.lock (Yarn v1 or Berry)
+  if (!packages) {
+    try {
+      const yarnContent = fs.readFileSync(path.join(cwd, 'yarn.lock'), 'utf8');
+      if (yarnContent.includes('__metadata:')) {
+        packages = parseYarnBerryLock(yarnContent);
+        lockfileUsed = 'yarn.lock (Berry)';
+      } else {
+        packages = parseYarnV1Lock(yarnContent);
+        lockfileUsed = 'yarn.lock (v1)';
+      }
+    } catch { /* fall through */ }
   }
 
-  // Extract all packages from the lockfile
-  const packages = extractPackagesFromLockfile(lockData);
+  // 3. pnpm-lock.yaml
+  if (!packages) {
+    try {
+      const pnpmContent = fs.readFileSync(path.join(cwd, 'pnpm-lock.yaml'), 'utf8');
+      packages = parsePnpmLock(pnpmContent);
+      lockfileUsed = 'pnpm-lock.yaml';
+    } catch { /* fall through */ }
+  }
+
+  if (!packages) {
+    return { error: 'No lockfile found — run npm install, yarn install, or pnpm install first (looked for: package-lock.json, yarn.lock, pnpm-lock.yaml)' };
+  }
 
   const components = packages.map((pkg) => {
     const scope = directDeps.has(pkg.name)
@@ -5086,7 +5640,10 @@ function generateSbom() {
         name: projectName,
         version: projectVersion,
         'bom-ref': `${projectName}@${projectVersion}`
-      }
+      },
+      properties: [
+        { name: 'sec-check:lockfileSource', value: lockfileUsed }
+      ]
     },
     components
   };
@@ -5790,7 +6347,7 @@ function checkProjectDistScan(threats, _testData) {
   }
 }
 
-module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, formatAsSarif, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan, checkCompromisedVersions, loadPolicy, applySuppressions, CHECK_NAMES, discoverWorkspaces, expandWorkspaceGlob, scanWorkspaces };
+module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, formatAsSarif, generateSbom, parseYarnV1Lock, parseYarnBerryLock, parsePnpmLock, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan, checkCompromisedVersions, loadPolicy, applySuppressions, CHECK_NAMES, discoverWorkspaces, expandWorkspaceGlob, scanWorkspaces, loadBaseline, saveBaseline, diffAgainstBaseline, BASELINE_FILE, checkIocFreshness, updateIocDbIfStale, IOC_WARN_DAYS, IOC_CRITICAL_DAYS };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow
