@@ -844,6 +844,344 @@ function isSafePackageName(name) {
   return /^(@[a-z0-9\-~][a-z0-9\-._~]*\/)?[a-z0-9\-~][a-z0-9\-._~]*$/.test(name);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Monorepo / Workspace recursive scanning
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Recursively collect all subdirectories under dir (excluding hidden dirs and
+ * node_modules). Helper for ** glob expansion.
+ *
+ * @param {string} dir - Absolute directory path.
+ * @returns {string[]} Absolute paths of dir and all its subdirectories.
+ */
+function _collectDirs(dir) {
+  const result = [dir];
+  try {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+        result.push(..._collectDirs(path.join(dir, entry.name)));
+      }
+    }
+  } catch { /* unreadable — skip */ }
+  return result;
+}
+
+/**
+ * Recursively resolve glob path parts against the filesystem.
+ * Supports * (single segment wildcard), ** (recursive), and literal segments.
+ *
+ * @param {string} base - Current resolved directory.
+ * @param {string[]} parts - Remaining unresolved path parts.
+ * @returns {string[]} Matched absolute directory paths.
+ */
+function _expandGlobParts(base, parts) {
+  if (parts.length === 0) return [base];
+  const [head, ...rest] = parts;
+
+  if (head === '**') {
+    const allDirs = _collectDirs(base);
+    if (rest.length === 0) return allDirs;
+    return allDirs.flatMap(d => _expandGlobParts(d, rest));
+  }
+
+  if (head === '*') {
+    try {
+      return fs.readdirSync(base, { withFileTypes: true })
+        .filter(e => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules')
+        .flatMap(e => _expandGlobParts(path.join(base, e.name), rest));
+    } catch { return []; }
+  }
+
+  if (head.includes('*') || head.includes('?')) {
+    // Wildcard segment — build a regex and match directory names
+    const reStr = '^' +
+      head.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+          .replace(/\*/g, '[^/]*')
+          .replace(/\?/g, '[^/]') +
+      '$';
+    const re = new RegExp(reStr);
+    try {
+      return fs.readdirSync(base, { withFileTypes: true })
+        .filter(e => e.isDirectory() && re.test(e.name) && e.name !== 'node_modules')
+        .flatMap(e => _expandGlobParts(path.join(base, e.name), rest));
+    } catch { return []; }
+  }
+
+  // Literal path segment
+  const next = path.join(base, head);
+  try {
+    if (fs.statSync(next).isDirectory()) return _expandGlobParts(next, rest);
+  } catch { /* not found */ }
+  return [];
+}
+
+/**
+ * Expand a workspace glob pattern relative to the monorepo root.
+ * Negation patterns (starting with !) are silently ignored.
+ * Only directories that contain a package.json are returned — confirming they
+ * are valid workspace package roots.
+ *
+ * @param {string} rootDir - Absolute path to the monorepo root.
+ * @param {string} pattern - Glob pattern relative to rootDir (e.g. "packages/*").
+ * @returns {string[]} Absolute paths to workspace package directories.
+ */
+function expandWorkspaceGlob(rootDir, pattern) {
+  if (typeof pattern !== 'string') return [];
+  const p = pattern.trim();
+  if (!p || p.startsWith('!')) return [];
+  const parts = p.replace(/\\/g, '/').split('/').filter(s => s.length > 0);
+  const candidates = _expandGlobParts(rootDir, parts);
+  // Only keep directories that have a package.json (real workspace packages)
+  return candidates.filter(d => {
+    try { return fs.statSync(path.join(d, 'package.json')).isFile(); } catch { return false; }
+  });
+}
+
+/**
+ * Parse package-pattern entries from a pnpm-workspace.yaml file.
+ * Only handles the standard format used by pnpm (list under "packages:").
+ * Negation entries (starting with !) are preserved so callers can filter them.
+ *
+ * @param {string} content - Raw YAML content of pnpm-workspace.yaml.
+ * @returns {string[]} Pattern strings.
+ */
+function _parsePnpmWorkspaceYaml(content) {
+  const patterns = [];
+  let inPackages = false;
+  for (const line of content.split('\n')) {
+    if (/^packages\s*:/.test(line.trim())) { inPackages = true; continue; }
+    if (inPackages) {
+      // List item: "  - 'pattern'" or '  - "pattern"' or "  - pattern"
+      const m = /^\s*-\s+['"]?([^'"#\r\n]+?)['"]?\s*(?:#.*)?$/.exec(line);
+      if (m) {
+        patterns.push(m[1].trim());
+      } else if (line.trim() && !/^\s*$/.test(line) && !/^\s*-/.test(line) && !/^\s*#/.test(line)) {
+        inPackages = false; // reached next top-level YAML key
+      }
+    }
+  }
+  return patterns;
+}
+
+/**
+ * Discover workspace package directories from the monorepo root.
+ * Checks (in priority order):
+ *   1. package.json "workspaces" — npm and Yarn workspaces
+ *   2. pnpm-workspace.yaml — pnpm workspaces
+ *   3. lerna.json "packages" — Lerna monorepos
+ *
+ * @param {string} [rootDir] - Monorepo root directory (defaults to cwd).
+ * @returns {{ dirs: string[], source: string|null }}
+ *   dirs:   Absolute paths to workspace package directories, each containing package.json.
+ *   source: Which config file the patterns were loaded from, or null if none found.
+ */
+function discoverWorkspaces(rootDir) {
+  const root = rootDir || process.cwd();
+
+  // 1. npm / Yarn workspaces — package.json
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    let patterns = null;
+    if (Array.isArray(pkg.workspaces)) {
+      patterns = pkg.workspaces;
+    } else if (pkg.workspaces && Array.isArray(pkg.workspaces.packages)) {
+      patterns = pkg.workspaces.packages; // Yarn { packages: [], nohoist: [] }
+    }
+    if (patterns) {
+      const dirs = [...new Set(patterns.flatMap(p => expandWorkspaceGlob(root, p)))];
+      return { dirs, source: 'package.json' };
+    }
+  } catch { /* no package.json or unparseable */ }
+
+  // 2. pnpm — pnpm-workspace.yaml
+  try {
+    const yamlPath = path.join(root, 'pnpm-workspace.yaml');
+    if (fs.existsSync(yamlPath)) {
+      const patterns = _parsePnpmWorkspaceYaml(fs.readFileSync(yamlPath, 'utf8'));
+      if (patterns.length > 0) {
+        const dirs = [...new Set(patterns.flatMap(p => expandWorkspaceGlob(root, p)))];
+        return { dirs, source: 'pnpm-workspace.yaml' };
+      }
+    }
+  } catch { /* unreadable */ }
+
+  // 3. Lerna — lerna.json
+  try {
+    const lernaPath = path.join(root, 'lerna.json');
+    if (fs.existsSync(lernaPath)) {
+      const lerna = JSON.parse(fs.readFileSync(lernaPath, 'utf8'));
+      const patterns = Array.isArray(lerna.packages) ? lerna.packages : ['packages/*'];
+      const dirs = [...new Set(patterns.flatMap(p => expandWorkspaceGlob(root, p)))];
+      return { dirs, source: 'lerna.json' };
+    }
+  } catch { /* invalid */ }
+
+  return { dirs: [], source: null };
+}
+
+/**
+ * Scan all workspace packages in a monorepo recursively.
+ *
+ * Discovers workspace packages from the root's workspace configuration
+ * (npm/Yarn package.json, pnpm-workspace.yaml, or lerna.json) and runs
+ * check() in isolation for each package, changing cwd per-package and
+ * always restoring it in a finally block.
+ *
+ * Human-readable mode: prints a header and diagnostic report per package,
+ * then an aggregate summary.
+ * JSON mode: returns a structured { workspaces, summary, metadata } object.
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.fix=false]    Auto-remediate fixable threats (passed to check()).
+ * @param {boolean} [options.json=false]   Return structured result object.
+ * @param {string}  [options._rootDir]     Override root directory (testing only).
+ * @returns {Promise<boolean|object>}
+ *   json=false: true if any threats detected, false if all clean.
+ *   json=true:  { workspaces, summary, metadata }
+ */
+async function scanWorkspaces(options = {}) {
+  const rootDir = options._rootDir || process.cwd();
+  const fix = options.fix || false;
+  const jsonMode = options.json || false;
+
+  const { dirs, source } = discoverWorkspaces(rootDir);
+
+  if (dirs.length === 0) {
+    if (!jsonMode) {
+      console.log('⚠️  No workspace packages found.');
+      console.log('   Add a "workspaces" field to your root package.json,');
+      console.log('   create a pnpm-workspace.yaml, or add a lerna.json.');
+    }
+    if (jsonMode) {
+      return {
+        workspaces: [],
+        summary: { packages: 0, packagesScanned: 0, packagesWithThreats: 0, totalThreats: 0, clean: true },
+        metadata: {
+          tool: '@sathyendra/security-checker',
+          version: require('./package.json').version,
+          timestamp: new Date().toISOString(),
+          root: rootDir,
+          workspaceSource: null
+        }
+      };
+    }
+    return false;
+  }
+
+  if (!jsonMode) {
+    const sep = '━'.repeat(60);
+    console.log(`\n${sep}`);
+    console.log(`  📦  Monorepo Scan — ${dirs.length} workspace package(s) found  [${source}]`);
+    console.log(sep + '\n');
+  }
+
+  const origCwd = process.cwd();
+  const workspaceResults = [];
+
+  for (const wsDir of dirs) {
+    // Resolve display name from package.json
+    let pkgName = path.basename(wsDir);
+    try {
+      const p = JSON.parse(fs.readFileSync(path.join(wsDir, 'package.json'), 'utf8'));
+      if (p.name) pkgName = p.name;
+    } catch { /* use dirname fallback */ }
+
+    const relPath = path.relative(rootDir, wsDir).replace(/\\/g, '/');
+
+    if (!jsonMode) {
+      const sep = '─'.repeat(60);
+      console.log(`${sep}`);
+      console.log(`  📁  ${relPath}  (${pkgName})`);
+      console.log(sep);
+    }
+
+    let wsResult;
+    try {
+      process.chdir(wsDir);
+      wsResult = await check({ fix, json: true, _policyDir: wsDir });
+    } catch (err) {
+      wsResult = {
+        threats: [{
+          message: `SCAN_ERROR: Failed to scan ${relPath} — ${err.message}`,
+          category: 'SCAN_ERROR', check: null, fixable: false, fixDescription: null
+        }],
+        summary: { total: 1, fixable: 0, manual: 1, suppressed: 0, clean: false },
+        metadata: {}
+      };
+    } finally {
+      try { process.chdir(origCwd); } catch { /* best-effort restore */ }
+    }
+
+    if (!jsonMode) {
+      if (wsResult.summary.clean) {
+        console.log('  ✅  Clean — no threats detected.\n');
+      } else {
+        for (const t of wsResult.threats) {
+          const fixTag = t.fixable ? '  [auto-fixable]' : '';
+          console.log(`  ⛔  [${t.category}] ${t.message}${fixTag}`);
+        }
+        if (wsResult.summary.suppressed > 0) {
+          console.log(`  ℹ️   ${wsResult.summary.suppressed} threat(s) suppressed by policy.`);
+        }
+        console.log();
+      }
+    }
+
+    workspaceResults.push({
+      path: relPath,
+      absolutePath: wsDir,
+      name: pkgName,
+      threats: wsResult.threats,
+      summary: wsResult.summary
+    });
+  }
+
+  // Aggregate
+  const totalThreats = workspaceResults.reduce((n, w) => n + w.summary.total, 0);
+  const packagesWithThreats = workspaceResults.filter(w => !w.summary.clean).length;
+  const allClean = packagesWithThreats === 0;
+
+  if (!jsonMode) {
+    const sep = '━'.repeat(60);
+    console.log(sep);
+    console.log('  Monorepo Scan Summary');
+    console.log(sep);
+    console.log(`  Packages scanned  : ${dirs.length}`);
+    console.log(`  Clean packages    : ${dirs.length - packagesWithThreats}`);
+    console.log(`  With threats      : ${packagesWithThreats}`);
+    console.log(`  Total threats     : ${totalThreats}`);
+    if (allClean) {
+      console.log('\n✅  All workspace packages are clean.\n');
+    } else {
+      console.log('\n⛔  Threats detected in one or more workspace packages.\n');
+    }
+    return !allClean;
+  }
+
+  const rootPkg = (() => {
+    try { return JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8')); } catch { return {}; }
+  })();
+  return {
+    workspaces: workspaceResults,
+    summary: {
+      packages: dirs.length,
+      packagesScanned: dirs.length,
+      packagesWithThreats,
+      totalThreats,
+      clean: allClean
+    },
+    metadata: {
+      tool: '@sathyendra/security-checker',
+      version: require('./package.json').version,
+      timestamp: new Date().toISOString(),
+      root: rootDir,
+      project: rootPkg.name || path.basename(rootDir),
+      workspaceSource: source
+    }
+  };
+}
+
 /**
  * Main security scan entry point.
  * Runs all detection modules sequentially and collects threats.
@@ -5452,7 +5790,7 @@ function checkProjectDistScan(threats, _testData) {
   }
 }
 
-module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, formatAsSarif, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan, checkCompromisedVersions, loadPolicy, applySuppressions, CHECK_NAMES };
+module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, formatAsSarif, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan, checkCompromisedVersions, loadPolicy, applySuppressions, CHECK_NAMES, discoverWorkspaces, expandWorkspaceGlob, scanWorkspaces };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow

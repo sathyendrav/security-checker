@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 // Import the main security scanning logic and IOC database utilities
-const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, formatAsSarif, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, loadPolicy, applySuppressions, CHECK_NAMES } = require('./check.js');
+const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, formatAsSarif, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, loadPolicy, applySuppressions, CHECK_NAMES, discoverWorkspaces, scanWorkspaces } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -107,6 +107,13 @@ Options:
                 Fails if the file already exists (use --force to overwrite).
   --show-policy Print the active policy loaded from .sec-check-policy.json (or
                 "all defaults" when no policy file exists), then exit.
+  --workspaces  Discover and scan all workspace packages defined in the root
+                package.json (npm/Yarn workspaces), pnpm-workspace.yaml, or
+                lerna.json. Each package is scanned independently in isolation
+                and results are aggregated into a monorepo report.
+                Combine with --json for machine-readable per-package results.
+                Combine with --fix to auto-remediate fixable threats.
+                Exit code 1 if any workspace package has threats.
   --help        Show this help message.
 
 Exit codes:
@@ -395,6 +402,20 @@ Exit codes:
   const sarifMode = args.includes('--sarif');
   const sarifOutIdx = args.indexOf('--sarif-out');
   const sarifOutFile = sarifOutIdx !== -1 ? args[sarifOutIdx + 1] : null;
+
+  // Handle --workspaces: discover and scan all workspace packages
+  if (args.includes('--workspaces')) {
+    const wsJsonMode = jsonMode || vexOut || sarifMode || !!sarifOutFile;
+    const wsResult = await scanWorkspaces({ fix, json: wsJsonMode });
+    if (wsJsonMode) {
+      console.log(JSON.stringify(wsResult, null, 2));
+      process.exit(wsResult.summary.clean ? 0 : 1);
+    } else {
+      process.exit(wsResult ? 1 : 0);
+    }
+    return;
+  }
+
   const preMode = args.includes('--pre');
   const postMode = args.includes('--post');
   const shieldMode = args.includes('--shield');
