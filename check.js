@@ -83,7 +83,8 @@ const CHECK_NAMES = [
   'packageCacheIocs',    // 19 npm/yarn/pnpm cache IOC scan
   'phantomDependencies', // 20 undeclared (phantom) dependencies
   'projectDistScan',     // 21 dist/build output malicious-artifact scan
-  'compromisedVersions'  // 22 version-scoped hijacked-package detection
+  'compromisedVersions', // 22 version-scoped hijacked-package detection
+  'sourceMapLeaks'       // 23 source map / source-leak detection
 ];
 
 /**
@@ -1744,6 +1745,17 @@ async function check(options = {}) {
     const t0 = threats.length;
     checkCompromisedVersions(threats);
     tagThreats(threats, 'compromisedVersions', t0);
+  }
+
+  // 23. Source map / source-leak detection (A05 — Security Misconfiguration).
+  //     Scans dist/build/out/lib/ for source maps that embed original source
+  //     code (sourcesContent), expose absolute local paths from developer
+  //     machines, reference cloud-storage URLs, or ship sourceMappingURL
+  //     comments that will expose source to package consumers.
+  if (enabled('sourceMapLeaks')) {
+    const t0 = threats.length;
+    checkSourceMapLeaks(threats);
+    tagThreats(threats, 'sourceMapLeaks', t0);
   }
 
   // ── Apply policy suppressions ──────────────────────────────────────────
@@ -5687,7 +5699,11 @@ const VEX_SEVERITY_MAP = {
   DIST_IOC: 'high',
   DIST_SUSPICIOUS: 'medium',
   PHANTOM_DEP: 'medium',
-  CACHE_IOC: 'high'
+  CACHE_IOC: 'high',
+  SOURCE_MAP_EMBED: 'high',
+  SOURCE_MAP_PATH: 'medium',
+  SOURCE_MAP_URL: 'medium',
+  SOURCE_MAP_CLOUD_URL: 'medium'
 };
 
 /**
@@ -5725,6 +5741,10 @@ function _sarifArtifactUri(category) {
       return '.env';
     case 'DIST_IOC':
     case 'DIST_SUSPICIOUS':
+    case 'SOURCE_MAP_EMBED':
+    case 'SOURCE_MAP_PATH':
+    case 'SOURCE_MAP_URL':
+    case 'SOURCE_MAP_CLOUD_URL':
       return 'dist/';
     default:
       return 'package.json';
@@ -6347,7 +6367,195 @@ function checkProjectDistScan(threats, _testData) {
   }
 }
 
-module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, formatAsSarif, generateSbom, parseYarnV1Lock, parseYarnBerryLock, parsePnpmLock, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan, checkCompromisedVersions, loadPolicy, applySuppressions, CHECK_NAMES, discoverWorkspaces, expandWorkspaceGlob, scanWorkspaces, loadBaseline, saveBaseline, diffAgainstBaseline, BASELINE_FILE, checkIocFreshness, updateIocDbIfStale, IOC_WARN_DAYS, IOC_CRITICAL_DAYS };
+// ─────────────────────────────────────────────────────────────────────────────
+//  23. Source Map / Source Leak Detection (OWASP A05)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Regex to detect absolute local file paths in source map "sources" entries.
+ * Matches common developer machine path prefixes on Unix/macOS and Windows.
+ */
+const SOURCE_MAP_LOCAL_PATH_RE = /^(?:\/(?:home|Users|root|usr|var|opt|srv)\/|[A-Za-z]:\\(?:Users|home)\\)/;
+
+/**
+ * Regex to detect cloud-storage URLs that should not appear in published
+ * source maps. Covers AWS S3, Google Cloud Storage, Azure Blob Storage,
+ * Cloudflare R2, and DigitalOcean Spaces.
+ */
+const SOURCE_MAP_CLOUD_URL_RE = /(?:https?:\/\/)?(?:[a-z0-9._-]+\.s3(?:-[a-z0-9-]+)?\.amazonaws\.com|storage\.googleapis\.com\/[a-z0-9._-]+|[a-z0-9._-]+\.blob\.core\.windows\.net|[a-z0-9._-]+\.r2\.cloudflarestorage\.com|[a-z0-9._-]+\.digitaloceanspaces\.com)/i;
+
+/**
+ * Scan the project's dist/build/out/lib/ output directories for source-map
+ * leakage issues (OWASP A05 — Security Misconfiguration).
+ *
+ * Four detection signals:
+ *   1. SOURCE_MAP_URL   — A built .js/.css file contains a `sourceMappingURL`
+ *      comment AND the referenced .map file is also present in the output,
+ *      meaning both will ship to consumers and expose source details.
+ *   2. SOURCE_MAP_EMBED — A .map file contains a non-empty `sourcesContent`
+ *      array, embedding the original source code directly in the artifact.
+ *   3. SOURCE_MAP_PATH  — A .map file's `sources` array includes absolute
+ *      local paths (/Users/..., C:\Users\...) that leak developer machine
+ *      topology to anyone inspecting the published package.
+ *   4. SOURCE_MAP_CLOUD_URL — A .map file's `sources` or `sourceRoot` field
+ *      contains cloud-storage URLs (S3, GCS, Azure Blob, R2, Spaces) that
+ *      expose internal infrastructure to public consumers.
+ *
+ * @param {{ message: string, category: string, fixable: boolean, fixDescription: string|null }[]} threats
+ * @param {object} [_testData] - Optional test injection.
+ * @param {string} [_testData.projectDir] - Project directory (defaults to cwd).
+ * @param {Object<string, string>} [_testData.distFiles] - Map of relative path → content.
+ */
+function checkSourceMapLeaks(threats, _testData) {
+  const SOURCE_MAP_DIRS = ['dist', 'build', 'out', 'lib', 'public'];
+  const SOURCE_MAP_MAX_FILE_SIZE = 524288; // 512 KB
+  const reported = new Set();
+
+  /**
+   * Analyse one file for source-map leakage signals.
+   * @param {string} relPath - Relative path (used in messages and dedup keys).
+   * @param {string} content - UTF-8 file content.
+   * @param {Set<string>} mapFilesPresent - Set of relative .map paths in the same scan.
+   */
+  function analyseFile(relPath, content, mapFilesPresent) {
+    const ext = path.extname(relPath).toLowerCase();
+
+    // ── Signal 1: sourceMappingURL in JS/CSS with present map ─────────────
+    if (ext === '.js' || ext === '.mjs' || ext === '.cjs' || ext === '.css') {
+      const mapUrlMatch = content.match(/\/\/[#@]\s*sourceMappingURL\s*=\s*(\S+)/);
+      if (mapUrlMatch) {
+        const mapRef = mapUrlMatch[1].trim();
+        if (!mapRef.startsWith('data:')) {
+          const dir = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/') + 1) : '';
+          const mapRelPath = dir + mapRef;
+          const mapPresent = mapFilesPresent.has(mapRelPath) || mapFilesPresent.has(mapRef);
+          if (mapPresent && !reported.has('smap:url:' + relPath)) {
+            reported.add('smap:url:' + relPath);
+            threats.push({
+              message: `SOURCE_MAP_URL: "${relPath}" references source map "${mapRef}" which is present in the output \u2014 map file may ship to consumers and expose source details (OWASP A05)`,
+              category: 'SOURCE_MAP_URL',
+              fixable: false,
+              fixDescription: 'Add the .map file to .npmignore, or remove the sourceMappingURL comment before publishing. Use sourcemap: false (webpack) or sourcemap: false (rollup) in production builds'
+            });
+          }
+        }
+      }
+    }
+
+    // ── Signals 2–4: parse .map JSON ──────────────────────────────────────
+    if (ext !== '.map') return;
+    let mapData;
+    try { mapData = JSON.parse(content); } catch { return; }
+
+    // Signal 2: embedded source code
+    if (Array.isArray(mapData.sourcesContent)) {
+      const nonEmpty = mapData.sourcesContent.filter(s => typeof s === 'string' && s.length > 0);
+      if (nonEmpty.length > 0 && !reported.has('smap:embed:' + relPath)) {
+        reported.add('smap:embed:' + relPath);
+        threats.push({
+          message: `SOURCE_MAP_EMBED: "${relPath}" contains "sourcesContent" with ${nonEmpty.length} embedded source file(s) \u2014 original source code ships inside this map file (OWASP A05)`,
+          category: 'SOURCE_MAP_EMBED',
+          fixable: false,
+          fixDescription: 'Rebuild with sourcemap options that omit sourcesContent: webpack devtool "nosources-source-map", rollup sourcemapExcludeSources: true'
+        });
+      }
+    }
+
+    const sources = Array.isArray(mapData.sources) ? mapData.sources : [];
+
+    // Signal 3: absolute local paths
+    const localPaths = sources.filter(s => typeof s === 'string' && SOURCE_MAP_LOCAL_PATH_RE.test(s));
+    if (localPaths.length > 0 && !reported.has('smap:path:' + relPath)) {
+      reported.add('smap:path:' + relPath);
+      threats.push({
+        message: `SOURCE_MAP_PATH: "${relPath}" contains ${localPaths.length} absolute local path(s) in "sources" (e.g. "${localPaths[0]}") \u2014 exposes developer machine topology (OWASP A05)`,
+        category: 'SOURCE_MAP_PATH',
+        fixable: false,
+        fixDescription: 'Configure your bundler to use relative source paths, or strip source maps from published output via .npmignore'
+      });
+    }
+
+    // Signal 4: cloud storage URLs
+    const allSourceRefs = [...sources];
+    if (typeof mapData.sourceRoot === 'string') allSourceRefs.push(mapData.sourceRoot);
+    const cloudUrls = allSourceRefs.filter(s => typeof s === 'string' && SOURCE_MAP_CLOUD_URL_RE.test(s));
+    if (cloudUrls.length > 0 && !reported.has('smap:cloud:' + relPath)) {
+      reported.add('smap:cloud:' + relPath);
+      threats.push({
+        message: `SOURCE_MAP_CLOUD_URL: "${relPath}" contains cloud storage URL(s) in "sources" (e.g. "${cloudUrls[0]}") \u2014 exposes internal infrastructure (OWASP A05)`,
+        category: 'SOURCE_MAP_CLOUD_URL',
+        fixable: false,
+        fixDescription: 'Remove cloud storage references from source maps before publishing'
+      });
+    }
+  }
+
+  // ── Test-data path ────────────────────────────────────────────────────────
+  if (_testData && _testData.distFiles) {
+    const mapFilesPresent = new Set(
+      Object.keys(_testData.distFiles).filter(k => k.endsWith('.map'))
+    );
+    for (const [relPath, content] of Object.entries(_testData.distFiles)) {
+      analyseFile(relPath, content, mapFilesPresent);
+    }
+    return;
+  }
+
+  // ── Real filesystem path ──────────────────────────────────────────────────
+  const projectDir = (_testData && _testData.projectDir) ? _testData.projectDir : process.cwd();
+
+  // First pass: collect all .map file relative paths in the output dirs
+  const mapFilesPresent = new Set();
+  function collectMapFiles(dir, baseDir, depth) {
+    if (depth > 6) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (entry.name === 'node_modules') continue;
+      const fullPath = path.join(dir, entry.name);
+      const rel = path.relative(baseDir, fullPath).split(path.sep).join('/');
+      if (entry.isDirectory()) {
+        collectMapFiles(fullPath, baseDir, depth + 1);
+      } else if (entry.isFile() && entry.name.endsWith('.map')) {
+        mapFilesPresent.add(rel);
+      }
+    }
+  }
+  for (const dirName of SOURCE_MAP_DIRS) {
+    const dirPath = path.join(projectDir, dirName);
+    if (fs.existsSync(dirPath)) collectMapFiles(dirPath, dirPath, 0);
+  }
+
+  // Second pass: analyse each scannable file
+  function walkAndAnalyse(dir, baseDir, depth) {
+    if (depth > 6) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (entry.name === 'node_modules') continue;
+      const fullPath = path.join(dir, entry.name);
+      const rel = path.relative(baseDir, fullPath).split(path.sep).join('/');
+      if (entry.isDirectory()) {
+        walkAndAnalyse(fullPath, baseDir, depth + 1);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (!['.js', '.mjs', '.cjs', '.css', '.map'].includes(ext)) continue;
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.size > SOURCE_MAP_MAX_FILE_SIZE) continue;
+          const content = fs.readFileSync(fullPath, 'utf8');
+          analyseFile(rel, content, mapFilesPresent);
+        } catch { /* unreadable */ }
+      }
+    }
+  }
+  for (const dirName of SOURCE_MAP_DIRS) {
+    const dirPath = path.join(projectDir, dirName);
+    if (fs.existsSync(dirPath)) walkAndAnalyse(dirPath, dirPath, 0);
+  }
+}
+
+module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, formatAsSarif, generateSbom, parseYarnV1Lock, parseYarnBerryLock, parsePnpmLock, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan, checkCompromisedVersions, checkSourceMapLeaks, loadPolicy, applySuppressions, CHECK_NAMES, discoverWorkspaces, expandWorkspaceGlob, scanWorkspaces, loadBaseline, saveBaseline, diffAgainstBaseline, BASELINE_FILE, checkIocFreshness, updateIocDbIfStale, IOC_WARN_DAYS, IOC_CRITICAL_DAYS };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow
