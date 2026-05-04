@@ -37,6 +37,50 @@ const IOC_SUBMISSION_REPO = 'https://github.com/sathyendrav/security-checker';
 const PROJECT_IOC_FILE = '.sec-check-ioc.json';
 
 /**
+ * Project-local policy file.
+ *
+ * Allows teams to configure suppressions, per-check enable/disable toggles,
+ * and numeric thresholds without modifying the scanner source.
+ * Create via: sec-check --init-policy  (or write manually — see docs).
+ *
+ * Schema:
+ *   version      {number}  Must be 1.
+ *   checks       {Object}  Map of checkName → boolean. false = disabled.
+ *   thresholds   {Object}  Numeric thresholds per check (see loadPolicy docs).
+ *   suppressions {Array}   List of suppression rules (see loadPolicy docs).
+ */
+const POLICY_FILE = '.sec-check-policy.json';
+
+/**
+ * Canonical check names used in policy.checks toggles and suppression rules.
+ * Each key corresponds to one detection module inside check().
+ */
+const CHECK_NAMES = [
+  'maliciousPackages',   // 1  plain-crypto-js and IOC-listed npm packages
+  'npmAudit',            // 2  npm audit high/critical vulnerabilities
+  'teamPCPArtifacts',   // 3  RAT/WAVESHAPER.V2 drop paths
+  'hostsFileC2',         // 4  C2 domain in /etc/hosts
+  'lockfileAudit',       // 5  deep lockfile malicious-package scan
+  'integritySwapAudit',  // 6  integrity hash & decoy-swap detection
+  'crossEcosystem',      // 7  Python / PyPI artifact scan
+  'provenanceAudit',     // 8  provenance attestation verification
+  'shadowExecution',     // 9  LD_PRELOAD / NODE_OPTIONS injection
+  'outdatedDeps',        // 10 major-version drift detection
+  'registryConfig',      // 11 npm registry configuration / Dependency Confusion
+  'lifecycleScripts',    // 12 lifecycle script injection in own package.json
+  'npmDoctor',           // 13 npm environment health
+  'lockfilePresence',    // 14 missing lockfile check
+  'secretsLeakage',      // 15 .env / hardcoded credentials
+  'ssrfIndicators',      // 16 C2 URLs embedded in node_modules sources
+  'dependencyScripts',   // 17 dependency lifecycle script sandboxing
+  'lockfileSentinel',    // 18 lockfile integrity hash verification
+  'packageCacheIocs',    // 19 npm/yarn/pnpm cache IOC scan
+  'phantomDependencies', // 20 undeclared (phantom) dependencies
+  'projectDistScan',     // 21 dist/build output malicious-artifact scan
+  'compromisedVersions'  // 22 version-scoped hijacked-package detection
+];
+
+/**
  * Ed25519 public key for verifying IOC database signatures.
  *
  * The IOC database is signed by the package maintainer using the corresponding
@@ -638,6 +682,155 @@ function getEffectiveIocs() {
   return merged;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Policy Engine — .sec-check-policy.json
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Load the project-local policy file (.sec-check-policy.json).
+ *
+ * The policy file controls three aspects of scanner behaviour:
+ *
+ *   checks       {Object<checkName, boolean>}
+ *     Map of canonical check names to on/off booleans.  Set a value to
+ *     `false` to entirely skip that detection module.  Unrecognised check
+ *     names are silently ignored.  All checks are enabled by default.
+ *     Valid names: see CHECK_NAMES constant.
+ *
+ *   thresholds   {Object}
+ *     Numeric overrides for checks that support configurable severity floors.
+ *     Currently supported:
+ *       npmAudit.minVulns      {number}  Minimum combined high+critical count
+ *                                        before a threat is raised (default 1).
+ *       outdatedDeps.minMajorDrift {number}  Minimum major-version gap before
+ *                                            a package is flagged (default 1).
+ *
+ *   suppressions {Array<SuppressionRule>}
+ *     List of suppression rules.  A threat is suppressed when ALL specified
+ *     fields on a rule match that threat.  At least one field must be set.
+ *
+ *     SuppressionRule fields (all optional):
+ *       check          {string}  Canonical check name (e.g. "outdatedDeps").
+ *       category       {string}  Threat category string (e.g. "OUTDATED").
+ *       messageContains {string} Case-insensitive substring of threat.message.
+ *       reason         {string}  Human-readable explanation (not evaluated).
+ *       until          {string}  ISO-8601 date string.  The suppression is
+ *                                automatically lifted after this date.
+ *
+ * Returns a normalised policy object; falls back to all-defaults when the
+ * file is absent, malformed, or unreadable.
+ *
+ * @param {string} [projectDir] - Project directory (defaults to cwd).
+ * @returns {{ version: number, checks: Object<string,boolean>, thresholds: Object, suppressions: Array }}
+ */
+function loadPolicy(projectDir) {
+  const dir = projectDir || process.cwd();
+  const filePath = path.join(dir, POLICY_FILE);
+  const defaults = { version: 1, checks: {}, thresholds: {}, suppressions: [] };
+  try {
+    if (!fs.existsSync(filePath)) return defaults;
+    const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (typeof raw !== 'object' || raw === null) return defaults;
+
+    // Validate & sanitise checks map
+    const checks = {};
+    if (typeof raw.checks === 'object' && raw.checks !== null) {
+      for (const key of CHECK_NAMES) {
+        if (Object.prototype.hasOwnProperty.call(raw.checks, key)) {
+          checks[key] = raw.checks[key] !== false; // anything truthy → enabled
+        }
+      }
+    }
+
+    // Validate & sanitise thresholds
+    const thresholds = {};
+    if (typeof raw.thresholds === 'object' && raw.thresholds !== null) {
+      const rawT = raw.thresholds;
+      if (typeof rawT.npmAudit === 'object' && rawT.npmAudit !== null) {
+        thresholds.npmAudit = {};
+        const mv = Number(rawT.npmAudit.minVulns);
+        if (Number.isFinite(mv) && mv >= 0) thresholds.npmAudit.minVulns = mv;
+      }
+      if (typeof rawT.outdatedDeps === 'object' && rawT.outdatedDeps !== null) {
+        thresholds.outdatedDeps = {};
+        const md = Number(rawT.outdatedDeps.minMajorDrift);
+        if (Number.isFinite(md) && md >= 1) thresholds.outdatedDeps.minMajorDrift = md;
+      }
+    }
+
+    // Validate & sanitise suppressions array
+    const suppressions = [];
+    if (Array.isArray(raw.suppressions)) {
+      for (const s of raw.suppressions) {
+        if (typeof s !== 'object' || s === null) continue;
+        const rule = {};
+        if (s.check && CHECK_NAMES.includes(s.check)) rule.check = s.check;
+        if (typeof s.category === 'string' && s.category.trim()) rule.category = s.category.trim();
+        if (typeof s.messageContains === 'string' && s.messageContains.trim()) rule.messageContains = s.messageContains.trim();
+        if (typeof s.reason === 'string') rule.reason = s.reason;
+        if (typeof s.until === 'string' && s.until.trim()) rule.until = s.until.trim();
+        // Must target at least one field to be a valid rule
+        if (rule.check || rule.category || rule.messageContains) suppressions.push(rule);
+      }
+    }
+
+    return { version: 1, checks, thresholds, suppressions };
+  } catch {
+    return defaults;
+  }
+}
+
+/**
+ * Filter a threats array against an array of suppression rules.
+ *
+ * A threat is removed when ALL specified fields on a suppression rule match:
+ *   - rule.check          must equal threat._check
+ *   - rule.category       must equal threat.category
+ *   - rule.messageContains must appear as a substring of threat.message (CI)
+ *   - rule.until          if set, the rule is inactive after that ISO date
+ *
+ * The _check field is an internal tag added inside check() — it is not
+ * exposed in JSON output.
+ *
+ * @param {{ message: string, category: string, _check?: string }[]} threats
+ * @param {Array<{ check?: string, category?: string, messageContains?: string, until?: string }>} suppressions
+ * @returns {{ message: string, category: string }[]}
+ */
+function applySuppressions(threats, suppressions) {
+  if (!suppressions || suppressions.length === 0) return threats;
+  const now = new Date();
+  return threats.filter(threat => {
+    for (const rule of suppressions) {
+      // Skip expired suppressions
+      if (rule.until) {
+        const expiry = new Date(rule.until);
+        if (!isNaN(expiry.getTime()) && now > expiry) continue;
+      }
+      // All specified fields must match
+      if (rule.check && threat._check !== rule.check) continue;
+      if (rule.category && threat.category !== rule.category) continue;
+      if (rule.messageContains && !threat.message.toLowerCase().includes(rule.messageContains.toLowerCase())) continue;
+      // Matched — suppress this threat
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * Tag all newly added threats (from threats[startLen] onwards) with an
+ * internal _check name so suppressions can target specific detection modules.
+ *
+ * @param {{ _check?: string }[]} threats - The shared threats array.
+ * @param {string} checkName - Canonical check name from CHECK_NAMES.
+ * @param {number} startLen - Length of threats array before the check ran.
+ */
+function tagThreats(threats, checkName, startLen) {
+  for (let i = startLen; i < threats.length; i++) {
+    threats[i]._check = checkName;
+  }
+}
+
 /**
  * Validate that a package name is safe for use in shell commands.
  * npm package names may only contain URL-safe characters (lowercase letters,
@@ -670,6 +863,11 @@ async function check(options = {}) {
   const threats = [];
   const sys = os.platform();
 
+  // Load project-local policy (.sec-check-policy.json) — toggles, thresholds, suppressions.
+  // A missing or unreadable file returns safe all-enabled defaults.
+  const policy = loadPolicy(options._policyDir);
+  const enabled = name => policy.checks[name] !== false;
+
   // CRITICAL: Check permissions first — RAT scans require admin/root
   const hasAdmin = await checkPermissions(sys);
   if (!hasAdmin) {
@@ -679,63 +877,69 @@ async function check(options = {}) {
   // 1. Known malicious package detection
   //    plain-crypto-js is a supply-chain attack package that mimics crypto-js.
   //    If present in node_modules, the project is compromised.
-  const malDir = path.join(process.cwd(), 'node_modules', 'plain-crypto-js');
-  if (fs.existsSync(malDir)) {
-    threats.push({
-      message: 'CRITICAL: plain-crypto-js detected in node_modules',
-      category: 'CRITICAL',
-      fixable: true,
-      fixDescription: 'npm uninstall plain-crypto-js',
-      fix: () => execSync('npm uninstall plain-crypto-js', { stdio: 'ignore', timeout: 30000 })
-    });
+  if (enabled('maliciousPackages')) {
+    const t0 = threats.length;
+    const malDir = path.join(process.cwd(), 'node_modules', 'plain-crypto-js');
+    if (fs.existsSync(malDir)) {
+      threats.push({
+        message: 'CRITICAL: plain-crypto-js detected in node_modules',
+        category: 'CRITICAL',
+        fixable: true,
+        fixDescription: 'npm uninstall plain-crypto-js',
+        fix: () => execSync('npm uninstall plain-crypto-js', { stdio: 'ignore', timeout: 30000 })
+      });
+    }
+    tagThreats(threats, 'maliciousPackages', t0);
   }
 
   // 2. npm audit — flag high and critical severity vulnerabilities.
   //    We run `npm audit --json` and parse the structured output.
   //    Only high and critical severities are flagged; low/moderate are ignored
   //    to reduce noise and avoid blocking installs unnecessarily.
-  try {
-    const auditOutput = execSync('npm audit --json', {
-      timeout: 30000,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore']
-    });
-    const data = JSON.parse(auditOutput);
-    const vulns = data.metadata && data.metadata.vulnerabilities
-      ? (data.metadata.vulnerabilities.high || 0) + (data.metadata.vulnerabilities.critical || 0)
-      : 0;
-    if (vulns > 0) {
-      threats.push({
-        message: `SECURITY: ${vulns} high/critical vulnerabilities found (run npm audit for details)`,
-        category: 'SECURITY',
-        fixable: true,
-        fixDescription: 'npm audit fix',
-        fix: () => execSync('npm audit fix', { stdio: 'ignore', timeout: 60000 })
+  //    Threshold: policy.thresholds.npmAudit.minVulns (default 1).
+  if (enabled('npmAudit')) {
+    const t0 = threats.length;
+    const minVulns = (policy.thresholds.npmAudit && Number.isFinite(policy.thresholds.npmAudit.minVulns))
+      ? policy.thresholds.npmAudit.minVulns : 1;
+    const pushAuditThreat = (vulns) => {
+      if (vulns >= minVulns) {
+        threats.push({
+          message: `SECURITY: ${vulns} high/critical vulnerabilities found (run npm audit for details)`,
+          category: 'SECURITY',
+          fixable: true,
+          fixDescription: 'npm audit fix',
+          fix: () => execSync('npm audit fix', { stdio: 'ignore', timeout: 60000 })
+        });
+      }
+    };
+    try {
+      const auditOutput = execSync('npm audit --json', {
+        timeout: 30000,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
       });
-    }
-  } catch (err) {
-    // npm audit exits with a non-zero code when vulnerabilities are present,
-    // so a "failed" execution is actually normal when issues exist.
-    // We capture stdout from the error object and parse it for vulnerability counts.
-    if (err.stdout) {
-      try {
-        const data = JSON.parse(err.stdout);
-        const vulns = data.metadata && data.metadata.vulnerabilities
-          ? (data.metadata.vulnerabilities.high || 0) + (data.metadata.vulnerabilities.critical || 0)
-          : 0;
-        if (vulns > 0) {
-          threats.push({
-            message: `SECURITY: ${vulns} high/critical vulnerabilities found (run npm audit for details)`,
-            category: 'SECURITY',
-            fixable: true,
-            fixDescription: 'npm audit fix',
-            fix: () => execSync('npm audit fix', { stdio: 'ignore', timeout: 60000 })
-          });
+      const data = JSON.parse(auditOutput);
+      const vulns = data.metadata && data.metadata.vulnerabilities
+        ? (data.metadata.vulnerabilities.high || 0) + (data.metadata.vulnerabilities.critical || 0)
+        : 0;
+      pushAuditThreat(vulns);
+    } catch (err) {
+      // npm audit exits with a non-zero code when vulnerabilities are present,
+      // so a "failed" execution is actually normal when issues exist.
+      // We capture stdout from the error object and parse it for vulnerability counts.
+      if (err.stdout) {
+        try {
+          const data = JSON.parse(err.stdout);
+          const vulns = data.metadata && data.metadata.vulnerabilities
+            ? (data.metadata.vulnerabilities.high || 0) + (data.metadata.vulnerabilities.critical || 0)
+            : 0;
+          pushAuditThreat(vulns);
+        } catch {
+          // Audit output unparseable — skip
         }
-      } catch {
-        // Audit output unparseable — skip
       }
     }
+    tagThreats(threats, 'npmAudit', t0);
   }
 
   // 3. TeamPCP / WAVESHAPER.V2 artifact detection (cross-ecosystem).
@@ -743,19 +947,29 @@ async function check(options = {}) {
   //    used by the TeamPCP (UNC1069) campaign across npm and Python ecosystems.
   //    Covers WAVESHAPER.V2 indicators on Windows, macOS, and Linux.
   //    Skipped without admin/root since those paths are typically protected.
-  if (hasAdmin) {
+  if (enabled('teamPCPArtifacts') && hasAdmin) {
+    const t0 = threats.length;
     checkTeamPCPArtifacts(sys, threats);
+    tagThreats(threats, 'teamPCPArtifacts', t0);
   }
 
   // 4. C2 (Command & Control) domain indicator in the system hosts file.
   //    Attackers sometimes modify the hosts file to redirect traffic to C2 servers.
-  checkHostsFile(threats);
+  if (enabled('hostsFileC2')) {
+    const t0 = threats.length;
+    checkHostsFile(threats);
+    tagThreats(threats, 'hostsFileC2', t0);
+  }
 
   // 5. Deep Lockfile Audit — recursively scan package-lock.json (or yarn.lock)
   //    for known malicious packages and suspicious "dropper" patterns.
   //    Dropper packages have install scripts but little to no real source code;
   //    they exist only to download and execute a payload (like plain-crypto-js).
-  deepLockfileAudit(threats);
+  if (enabled('lockfileAudit')) {
+    const t0 = threats.length;
+    deepLockfileAudit(threats);
+    tagThreats(threats, 'lockfileAudit', t0);
+  }
 
   // 6. Integrity Checksum & Decoy Swap Detection
   //    Inspired by the Axios attack where malicious code deleted its own package.json
@@ -764,14 +978,22 @@ async function check(options = {}) {
   //      a) Compare installed package integrity hashes against the npm registry
   //      b) Detect swap artifacts (package.md, .bak, .orig files)
   //      c) Flag packages where package.json was modified after installation
-  await integrityAndSwapAudit(threats);
+  if (enabled('integritySwapAudit')) {
+    const t0 = threats.length;
+    await integrityAndSwapAudit(threats);
+    tagThreats(threats, 'integritySwapAudit', t0);
+  }
 
   // 7. Cross-ecosystem artifact scan (Python / PyPI).
   //    TeamPCP (UNC1069) targets both npm and PyPI. Developers often work in
   //    mixed-ecosystem projects. This scans for known malicious PyPI packages
   //    in requirements.txt / Pipfile.lock and checks for Python-based backdoor
   //    stagers in common staging directories.
-  crossEcosystemScan(threats);
+  if (enabled('crossEcosystem')) {
+    const t0 = threats.length;
+    crossEcosystemScan(threats);
+    tagThreats(threats, 'crossEcosystem', t0);
+  }
 
   // 8. Provenance Verification — "Shadow Execution" detection.
   //    Attackers bypass GitHub Actions / OIDC by using stolen long-lived npm
@@ -779,20 +1001,45 @@ async function check(options = {}) {
   //    (axios, lodash, etc.) are expected to have provenance attestations proving
   //    they were published from a CI/CD pipeline linked to a GitHub repository.
   //    A manual publish of a popular package is a strong indicator of token theft.
-  await provenanceAudit(threats);
+  if (enabled('provenanceAudit')) {
+    const t0 = threats.length;
+    await provenanceAudit(threats);
+    tagThreats(threats, 'provenanceAudit', t0);
+  }
 
   // 9. Process-level shadow execution detection.
   //    Checks for library preload hijacking (LD_PRELOAD, DYLD_INSERT_LIBRARIES),
   //    NODE_OPTIONS --require injection, and suspicious parent processes (netcat,
   //    mshta, wscript, and other LOLBins). These indicate the Node.js process
   //    was spawned or hijacked by a reverse shell or stager chain.
-  checkShadowExecution(sys, threats);
+  if (enabled('shadowExecution')) {
+    const t0 = threats.length;
+    checkShadowExecution(sys, threats);
+    tagThreats(threats, 'shadowExecution', t0);
+  }
 
   // 10. Outdated dependency detection (A06 — Vulnerable and Outdated Components).
   //     Runs `npm outdated --json` and flags packages where the installed version
   //     is a major version behind the latest release. Major version drift often
   //     means the package no longer receives security patches.
-  checkOutdatedDeps(threats);
+  //     Threshold: policy.thresholds.outdatedDeps.minMajorDrift (default 1).
+  if (enabled('outdatedDeps')) {
+    const t0 = threats.length;
+    checkOutdatedDeps(threats);
+    const minDrift = (policy.thresholds.outdatedDeps && Number.isFinite(policy.thresholds.outdatedDeps.minMajorDrift))
+      ? policy.thresholds.outdatedDeps.minMajorDrift : 1;
+    if (minDrift > 1) {
+      // Remove OUTDATED threats that don't meet the configured drift threshold.
+      // The message format is: "OUTDATED: <pkg>@<ver> is <N> major version(s) behind (latest: <v>)"
+      for (let i = threats.length - 1; i >= t0; i--) {
+        if (threats[i].category === 'OUTDATED') {
+          const m = /is (\d+) major version/.exec(threats[i].message);
+          if (m && parseInt(m[1], 10) < minDrift) threats.splice(i, 1);
+        }
+      }
+    }
+    tagThreats(threats, 'outdatedDeps', t0);
+  }
 
   // 11. Registry configuration check (A08 — Software and Data Integrity Failures).
   //     Verifies that the configured npm registry is the official one
@@ -801,7 +1048,11 @@ async function check(options = {}) {
   //     an internal package name is claimed on the rogue registry.
   //     Checks project .npmrc, user ~/.npmrc, npm effective config, and
   //     lockfile resolved URLs for non-official registry hosts.
-  checkRegistryConfig(threats);
+  if (enabled('registryConfig')) {
+    const t0 = threats.length;
+    checkRegistryConfig(threats);
+    tagThreats(threats, 'registryConfig', t0);
+  }
 
   // 12. Lifecycle script injection detection (A03 — Injection).
   //     Scans the project's own package.json lifecycle hooks (postinstall,
@@ -810,52 +1061,84 @@ async function check(options = {}) {
   //     (base64, eval), and remote code execution patterns. Unlike step 5
   //     (dropper detection on dependencies), this targets the project itself.
   //     Recommendation: use `npm install --ignore-scripts` during vetting.
-  checkLifecycleScripts(threats);
+  if (enabled('lifecycleScripts')) {
+    const t0 = threats.length;
+    checkLifecycleScripts(threats);
+    tagThreats(threats, 'lifecycleScripts', t0);
+  }
 
   // 13. npm doctor — environment health check (A05 — Security Misconfiguration).
   //     Runs `npm doctor` and flags any failing checks (permission issues,
   //     cache corruption, unreachable registry). These misconfigurations can
   //     lead to privilege escalation or cache poisoning.
-  checkNpmDoctor(threats);
+  if (enabled('npmDoctor')) {
+    const t0 = threats.length;
+    checkNpmDoctor(threats);
+    tagThreats(threats, 'npmDoctor', t0);
+  }
 
   // 14. Lockfile enforcement (A05 — Security Misconfiguration).
   //     Alerts if the project has no package-lock.json, yarn.lock, or
   //     pnpm-lock.yaml. Without a lockfile, builds are non-deterministic
   //     and vulnerable to "latest version" poisoning.
-  checkLockfilePresence(threats);
+  if (enabled('lockfilePresence')) {
+    const t0 = threats.length;
+    checkLockfilePresence(threats);
+    tagThreats(threats, 'lockfilePresence', t0);
+  }
 
   // 15. Secrets detection (A05 — Security Misconfiguration).
   //     Scans for .env files and hardcoded credentials (NPM_TOKEN,
   //     AWS keys, GitHub tokens, PEM private keys, passwords) in
   //     project-root source files that could be accidentally published.
-  checkSecretsLeakage(threats);
+  if (enabled('secretsLeakage')) {
+    const t0 = threats.length;
+    checkSecretsLeakage(threats);
+    tagThreats(threats, 'secretsLeakage', t0);
+  }
 
   // 16. SSRF indicator detection (A10 — Server-Side Request Forgery).
   //     Scans installed packages in node_modules/ for hardcoded URLs and
   //     IP addresses pointing to known C2 / malware infrastructure.
   //     While SSRF is a runtime risk, compromised packages embed callback
   //     URLs directly — this catches them before they can phone home.
-  checkSsrfIndicators(threats);
+  if (enabled('ssrfIndicators')) {
+    const t0 = threats.length;
+    checkSsrfIndicators(threats);
+    tagThreats(threats, 'ssrfIndicators', t0);
+  }
 
   // 17. Dependency Script Sandboxing (OWASP A03).
   //     Scans lifecycle scripts of ALL dependencies in node_modules/ for
   //     risky patterns (curl, wget, eval, base64, etc.).  Packages on the
   //     project-local approved list (.sec-check-approved.json) are skipped.
   //     Users vet flagged packages and allowlist them via --approve.
-  checkDependencyScripts(threats);
+  if (enabled('dependencyScripts')) {
+    const t0 = threats.length;
+    checkDependencyScripts(threats);
+    tagThreats(threats, 'dependencyScripts', t0);
+  }
 
   // 18. Lockfile Sentinel — integrity hash verification (OWASP A08).
   //     Compares every package hash in the lockfile against a known-compromised
   //     hash database BEFORE npm install runs. Also flags packages with no
   //     integrity hash (non-deterministic builds vulnerable to MITM).
-  lockfileSentinel(threats);
+  if (enabled('lockfileSentinel')) {
+    const t0 = threats.length;
+    lockfileSentinel(threats);
+    tagThreats(threats, 'lockfileSentinel', t0);
+  }
 
   // 19. Package Manager Cache IOC Scan (OWASP A08).
   //     Scans npm (~/.npm/_cacache), yarn (~/.yarn/cache), and pnpm
   //     (~/.pnpm-store) cache directories for package names matching the IOC
   //     malicious-package list. A cached malicious package can be silently
   //     re-installed from the local cache even after removal from node_modules.
-  checkPackageCacheIocs(threats);
+  if (enabled('packageCacheIocs')) {
+    const t0 = threats.length;
+    checkPackageCacheIocs(threats);
+    tagThreats(threats, 'packageCacheIocs', t0);
+  }
 
   // 20. Phantom Dependency Detection (OWASP A06).
   //     Parses require()/import statements in project source files and flags
@@ -863,32 +1146,53 @@ async function check(options = {}) {
   //     work only because a transitive dependency pulled them in — making the
   //     project fragile and vulnerable to Dependency Confusion if that
   //     transitive dep is later removed or changed.
-  checkPhantomDependencies(threats);
+  if (enabled('phantomDependencies')) {
+    const t0 = threats.length;
+    checkPhantomDependencies(threats);
+    tagThreats(threats, 'phantomDependencies', t0);
+  }
 
   // 21. Project dist/ Build Output Scan (OWASP A03/A08).
   //     Scans dist/, build/, out/, lib/ for known malicious package names
   //     embedded as string literals, C2 domains, and obfuscation patterns
   //     (eval+atob, execSync+decode chains). Catches supply-chain injection
   //     into the build pipeline before the artifact is published or deployed.
-  checkProjectDistScan(threats);
+  if (enabled('projectDistScan')) {
+    const t0 = threats.length;
+    checkProjectDistScan(threats);
+    tagThreats(threats, 'projectDistScan', t0);
+  }
 
   // 22. Version-scoped compromised package detection (OWASP A06).
   //     Detects legitimate packages whose specific published versions were
   //     hijacked (e.g. CanisterWorm, CanisterSprawl campaigns). Name-only
   //     blocklist detection is insufficient here — only certain version
   //     ranges are malicious. Checks both installed node_modules and lockfile.
-  checkCompromisedVersions(threats);
+  if (enabled('compromisedVersions')) {
+    const t0 = threats.length;
+    checkCompromisedVersions(threats);
+    tagThreats(threats, 'compromisedVersions', t0);
+  }
+
+  // ── Apply policy suppressions ──────────────────────────────────────────
+  // Filter out threats matched by suppression rules BEFORE reporting.
+  const activeThreatCount = threats.length;
+  const visibleThreats = applySuppressions(threats, policy.suppressions);
+  const suppressedCount = activeThreatCount - visibleThreats.length;
 
   // ── Diagnostic Report ──────────────────────────────────────────────────
   // Always printed. Shows every threat with its category and fixability.
   if (!jsonMode) {
-    printDiagnosticReport(threats, fix);
+    printDiagnosticReport(visibleThreats, fix);
+    if (suppressedCount > 0) {
+      console.log(`ℹ️  ${suppressedCount} threat(s) suppressed by ${POLICY_FILE}`);
+    }
   }
 
   // ── Auto-remediation (only when --fix is passed) ───────────────────────
   // The tool is read-only by default. Fixes are opt-in and non-destructive.
-  if (fix && threats.some(t => t.fixable)) {
-    await runFixes(threats);
+  if (fix && visibleThreats.some(t => t.fixable)) {
+    await runFixes(visibleThreats);
   }
 
   // ── JSON mode: return structured result object ─────────────────────────
@@ -898,19 +1202,21 @@ async function check(options = {}) {
         return JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
       } catch { return {}; }
     })();
-    const fixableCount = threats.filter(t => t.fixable).length;
+    const fixableCount = visibleThreats.filter(t => t.fixable).length;
     return {
-      threats: threats.map(t => ({
+      threats: visibleThreats.map(t => ({
         message: t.message,
         category: t.category,
+        check: t._check || null,
         fixable: t.fixable,
         fixDescription: t.fixDescription || null
       })),
       summary: {
-        total: threats.length,
+        total: visibleThreats.length,
         fixable: fixableCount,
-        manual: threats.length - fixableCount,
-        clean: threats.length === 0
+        manual: visibleThreats.length - fixableCount,
+        suppressed: suppressedCount,
+        clean: visibleThreats.length === 0
       },
       metadata: {
         tool: '@sathyendra/security-checker',
@@ -918,12 +1224,13 @@ async function check(options = {}) {
         timestamp: new Date().toISOString(),
         project: pkg.name || path.basename(process.cwd()),
         platform: sys,
-        node: process.version
+        node: process.version,
+        policyFile: suppressedCount > 0 || Object.keys(policy.checks).length > 0 ? POLICY_FILE : null
       }
     };
   }
 
-  return threats.length > 0;
+  return visibleThreats.length > 0;
 }
 
 /**
@@ -5145,7 +5452,7 @@ function checkProjectDistScan(threats, _testData) {
   }
 }
 
-module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, formatAsSarif, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan, checkCompromisedVersions };
+module.exports = { check, shield, preinstall, postVet, initShield, updateDb, getDbPath, loadIocDb, getEffectiveIocs, verifyIocSignature, formatAsVex, formatAsSarif, generateSbom, checkOutdatedDeps, checkRegistryConfig, checkLifecycleScripts, checkNpmDoctor, checkLockfilePresence, checkSecretsLeakage, checkSsrfIndicators, checkEnvironment, checkDependencyScripts, approvePackage, loadApprovedPackages, scriptBlocker, registryGuard, lockfileSentinel, loadProjectIocs, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, checkPackageCacheIocs, checkPhantomDependencies, checkProjectDistScan, checkCompromisedVersions, loadPolicy, applySuppressions, CHECK_NAMES };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Zero Trust Shield — multi-stage install workflow

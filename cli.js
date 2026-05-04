@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 // Import the main security scanning logic and IOC database utilities
-const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, formatAsSarif, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl } = require('./check.js');
+const { check, shield, preinstall, postVet, initShield, approvePackage, updateDb, getDbPath, loadIocDb, formatAsVex, formatAsSarif, generateSbom, addProjectIoc, buildIocSubmission, buildIocBatchSubmission, openUrl, loadPolicy, applySuppressions, CHECK_NAMES } = require('./check.js');
 
 /**
  * Entry point for the `sec-check` CLI command.
@@ -102,6 +102,11 @@ Options:
                 Add --split to generate one URL per IOC entry instead of one
                 combined issue.
                 Add --open to immediately open each URL in the default browser.
+  --init-policy Create a starter .sec-check-policy.json in the current directory
+                with all checks enabled, empty thresholds, and no suppressions.
+                Fails if the file already exists (use --force to overwrite).
+  --show-policy Print the active policy loaded from .sec-check-policy.json (or
+                "all defaults" when no policy file exists), then exit.
   --help        Show this help message.
 
 Exit codes:
@@ -297,6 +302,79 @@ Exit codes:
       console.log('\n   All scripts were already configured. No changes made.');
     }
     console.log();
+    process.exit(0);
+  }
+
+  // Handle --show-policy: display the active policy and exit
+  if (args.includes('--show-policy')) {
+    const policy = loadPolicy();
+    const hasFile = (() => {
+      try { return require('fs').existsSync(require('path').join(process.cwd(), '.sec-check-policy.json')); } catch { return false; }
+    })();
+    if (!hasFile) {
+      console.log('No .sec-check-policy.json found — all defaults active (all checks enabled, no suppressions).');
+    } else {
+      console.log('Active policy from .sec-check-policy.json:\n');
+      const disabled = CHECK_NAMES.filter(n => policy.checks[n] === false);
+      const enabled  = CHECK_NAMES.filter(n => policy.checks[n] !== false);
+      console.log(`  Checks enabled  : ${enabled.length === CHECK_NAMES.length ? 'all (22)' : enabled.join(', ')}`);
+      if (disabled.length) console.log(`  Checks disabled : ${disabled.join(', ')}`);
+      if (Object.keys(policy.thresholds).length) {
+        console.log('\n  Thresholds:');
+        for (const [k, v] of Object.entries(policy.thresholds)) {
+          console.log(`    ${k}: ${JSON.stringify(v)}`);
+        }
+      }
+      if (policy.suppressions.length) {
+        console.log(`\n  Suppressions (${policy.suppressions.length}):`);
+        for (const s of policy.suppressions) {
+          const parts = [];
+          if (s.check)           parts.push(`check=${s.check}`);
+          if (s.category)        parts.push(`category=${s.category}`);
+          if (s.messageContains) parts.push(`messageContains="${s.messageContains}"`);
+          if (s.until)           parts.push(`until=${s.until}`);
+          if (s.reason)          parts.push(`reason="${s.reason}"`);
+          console.log(`    - ${parts.join('  ')}`);
+        }
+      } else {
+        console.log('\n  Suppressions    : none');
+      }
+    }
+    process.exit(0);
+  }
+
+  // Handle --init-policy: scaffold a starter .sec-check-policy.json
+  if (args.includes('--init-policy')) {
+    const policyPath = require('path').join(process.cwd(), '.sec-check-policy.json');
+    const force = args.includes('--force');
+    if (require('fs').existsSync(policyPath) && !force) {
+      console.error('❌ .sec-check-policy.json already exists. Use --force to overwrite.');
+      process.exit(1);
+    }
+    const checksObj = {};
+    for (const n of CHECK_NAMES) checksObj[n] = true;
+    const starter = {
+      $schema: 'https://raw.githubusercontent.com/sathyendrav/security-checker/main/schema/policy.schema.json',
+      version: 1,
+      checks: checksObj,
+      thresholds: {
+        npmAudit: { minVulns: 1 },
+        outdatedDeps: { minMajorDrift: 1 }
+      },
+      suppressions: [
+        {
+          _comment: 'Example: suppress OUTDATED findings for a specific package',
+          check: 'outdatedDeps',
+          messageContains: 'some-package',
+          reason: 'Internal fork — not updated on npm',
+          until: '2026-12-31'
+        }
+      ]
+    };
+    require('fs').writeFileSync(policyPath, JSON.stringify(starter, null, 2) + '\n', 'utf8');
+    console.log('✅ Created .sec-check-policy.json');
+    console.log('   Edit it to disable checks, tune thresholds, or add suppressions.');
+    console.log(`   Run 'sec-check --show-policy' to verify your configuration.`);
     process.exit(0);
   }
 

@@ -25,3 +25,5 @@ Thumbs.db
 .dcignore
 .github/copilot-instructions.md
 docs/
+/tmp
+*.log

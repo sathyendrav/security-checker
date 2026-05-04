@@ -6,5 +6,6 @@ test/
 .dcignore
 *.md
 !README.md
-
+/tmp
+*.log
 .github/copilot-instructions.md

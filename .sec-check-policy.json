@@ -1,0 +1,62 @@
+{
+  "$schema": "https://raw.githubusercontent.com/sathyendrav/security-checker/main/schema/policy.schema.json",
+  "version": 1,
+
+  "_comment_checks": "Set any check to false to skip that detection module entirely.",
+  "checks": {
+    "maliciousPackages":   true,
+    "npmAudit":            true,
+    "teamPCPArtifacts":   true,
+    "hostsFileC2":         true,
+    "lockfileAudit":       true,
+    "integritySwapAudit":  true,
+    "crossEcosystem":      true,
+    "provenanceAudit":     true,
+    "shadowExecution":     true,
+    "outdatedDeps":        true,
+    "registryConfig":      true,
+    "lifecycleScripts":    true,
+    "npmDoctor":           true,
+    "lockfilePresence":    true,
+    "secretsLeakage":      true,
+    "ssrfIndicators":      true,
+    "dependencyScripts":   true,
+    "lockfileSentinel":    true,
+    "packageCacheIocs":    true,
+    "phantomDependencies": true,
+    "projectDistScan":     true,
+    "compromisedVersions": true
+  },
+
+  "_comment_thresholds": "Numeric floors — threats below these levels are not raised.",
+  "thresholds": {
+    "npmAudit": {
+      "_comment": "Minimum combined high+critical vuln count before flagging (default: 1).",
+      "minVulns": 1
+    },
+    "outdatedDeps": {
+      "_comment": "Minimum major-version gap before a package is flagged (default: 1).",
+      "minMajorDrift": 1
+    }
+  },
+
+  "_comment_suppressions": [
+    "Each rule suppresses threats where ALL specified fields match.",
+    "Fields: check, category, messageContains, reason, until (ISO date — auto-expires).",
+    "At least one of check / category / messageContains must be set."
+  ],
+  "suppressions": [
+    {
+      "_comment": "Example: suppress outdated-dep noise for an internal fork.",
+      "check": "outdatedDeps",
+      "messageContains": "some-internal-package",
+      "reason": "Internal fork — not updated on npm",
+      "until": "2026-12-31"
+    },
+    {
+      "_comment": "Example: suppress all NPM_DOCTOR findings in offline CI.",
+      "category": "NPM_DOCTOR",
+      "reason": "npm doctor is unreliable in air-gapped CI environments"
+    }
+  ]
+}
